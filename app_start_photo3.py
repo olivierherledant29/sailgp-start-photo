@@ -5,8 +5,13 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from dotenv import load_dotenv
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    # En Streamlit Cloud, on utilise st.secrets / variables d'env, pas .env
+    pass
+
 
 from influx_io import (
     get_cfg,
