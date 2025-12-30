@@ -1,6 +1,6 @@
 streamlit
-pydeck
 pandas
 numpy
-shapely>=2.0
-pyproj
+pydeck
+influxdb-client
+python-dotenv
