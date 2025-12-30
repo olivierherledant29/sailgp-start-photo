@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+
+# Env / secrets
+.env
+
+# Streamlit
+.streamlit/
+
+# Office lock files
+.~lock.*
+
+# Exports / data (évite de pousser des gros CSV/ODS)
+*.csv
+*.ods
+
+# OS
+.DS_Store
+Thumbs.db
