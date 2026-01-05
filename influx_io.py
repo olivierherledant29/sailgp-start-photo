@@ -183,14 +183,7 @@ def load_boat_snapshot(cfg: InfluxCfg, start_gun_utc: datetime, offset_s: int, h
     base = pd.DataFrame({"boat": ALL_BOATS})
 
     for ch in BOAT_CHANNELS:
-        df_ch = query_mean_by_boat(
-            cfg=cfg,
-            measurement=ch,
-            boats=ALL_BOATS,
-            start_utc=t0,
-            stop_utc=t1,
-            level_expr="strm",
-        ).rename(columns={"value": ch})
+        df_ch = query_mean_by_boat(cfg, ch, ALL_BOATS, t0, t1, "strm").rename(columns={"value": ch})
         base = base.merge(df_ch, on="boat", how="left")
 
     base["BSP_kmph"] = pd.to_numeric(base.get("BOAT_SPEED_km_h_1"), errors="coerce")
@@ -209,33 +202,17 @@ def load_boat_snapshot(cfg: InfluxCfg, start_gun_utc: datetime, offset_s: int, h
 def load_marks_snapshot(cfg: InfluxCfg, start_gun_utc: datetime, offset_s: int, half_window_s: int = 5) -> pd.DataFrame:
     t0, t1 = snapshot_window_times(start_gun_utc, offset_s, half_window_s)
 
-    df_lat = query_mean_by_boat(
-        cfg=cfg,
-        measurement=MARK_LAT_CH,
-        boats=MARKS,
-        start_utc=t0,
-        stop_utc=t1,
-        level_expr="mdss|mdss_fast|strm|raw",
-    ).rename(columns={"value": "lat"})
-
-    df_lon = query_mean_by_boat(
-        cfg=cfg,
-        measurement=MARK_LON_CH,
-        boats=MARKS,
-        start_utc=t0,
-        stop_utc=t1,
-        level_expr="mdss|mdss_fast|strm|raw",
-    ).rename(columns={"value": "lon"})
+    df_lat = query_mean_by_boat(cfg, MARK_LAT_CH, MARKS, t0, t1, "mdss|mdss_fast|strm|raw").rename(columns={"value": "lat"})
+    df_lon = query_mean_by_boat(cfg, MARK_LON_CH, MARKS, t0, t1, "mdss|mdss_fast|strm|raw").rename(columns={"value": "lon"})
 
     out = pd.DataFrame({"mark": MARKS}).rename(columns={"mark": "boat"})
-    out = out.merge(df_lat, on="boat", how="left")
-    out = out.merge(df_lon, on="boat", how="left")
+    out = out.merge(df_lat, on="boat", how="left").merge(df_lon, on="boat", how="left")
     out = out.rename(columns={"boat": "mark"})
     return out
 
 
 # -----------------------
-# AVG_fleet vector: mean displacement (hors FRA), endpoints +/-1s
+# AVG_fleet vector: mean displacement (hors FRA)
 # -----------------------
 
 def load_avg_fleet_vector_mean_displacement(
@@ -257,9 +234,7 @@ def load_avg_fleet_vector_mean_displacement(
     lat1 = query_last_by_boat(cfg, "LATITUDE_GPS_unk", boats, t1a, t1b, "strm").rename(columns={"value": "lat1"})
     lon1 = query_last_by_boat(cfg, "LONGITUDE_GPS_unk", boats, t1a, t1b, "strm").rename(columns={"value": "lon1"})
 
-    df = lat0.merge(lon0, on="boat", how="inner").merge(
-        lat1.merge(lon1, on="boat", how="inner"), on="boat", how="inner"
-    )
+    df = lat0.merge(lon0, on="boat", how="inner").merge(lat1.merge(lon1, on="boat", how="inner"), on="boat", how="inner")
     if df.empty:
         return {"bearing_deg": float("nan"), "distance_m": float("nan")}
 
@@ -273,8 +248,8 @@ def load_avg_fleet_vector_mean_displacement(
     m_per_deg_lat = 111_320.0
     m_per_deg_lon = 111_320.0 * float(np.cos(np.deg2rad(lat_ref)))
 
-    dx = (df["lon1"] - df["lon0"]) * m_per_deg_lon  # east
-    dy = (df["lat1"] - df["lat0"]) * m_per_deg_lat  # north
+    dx = (df["lon1"] - df["lon0"]) * m_per_deg_lon
+    dy = (df["lat1"] - df["lat0"]) * m_per_deg_lat
 
     dxm = float(np.nanmean(dx))
     dym = float(np.nanmean(dy))
@@ -283,8 +258,55 @@ def load_avg_fleet_vector_mean_displacement(
     if not np.isfinite([dxm, dym, dist_mean]).all():
         return {"bearing_deg": float("nan"), "distance_m": float("nan")}
 
-    bearing = float((np.degrees(np.arctan2(dxm, dym)) + 360.0) % 360.0)  # atan2(E, N)
+    bearing = float((np.degrees(np.arctan2(dxm, dym)) + 360.0) % 360.0)
     return {"bearing_deg": bearing, "distance_m": dist_mean}
+
+
+# -----------------------
+# NEW: Timeseries lat/lon (1 Hz) pour crossing
+# -----------------------
+
+@st.cache_data(show_spinner=False, ttl=300)
+def load_latlon_timeseries_1s(cfg: InfluxCfg, boats: list[str], start_utc: datetime, stop_utc: datetime) -> pd.DataFrame:
+    boats_or = " or ".join([f'r["boat"] == "{b}"' for b in boats])
+    flux = f'''
+from(bucket: "{cfg.bucket}")
+  |> range(start: {iso_z(start_utc)}, stop: {iso_z(stop_utc)})
+  |> filter(fn: (r) => r["_field"] == "value")
+  |> filter(fn: (r) => (r["_measurement"] == "LATITUDE_GPS_unk" or r["_measurement"] == "LONGITUDE_GPS_unk"))
+  |> filter(fn: (r) => r["level"] =~ /strm/)
+  |> filter(fn: (r) => {boats_or})
+  |> aggregateWindow(every: 1s, fn: mean, createEmpty: false)
+  |> pivot(rowKey:["_time","boat"], columnKey:["_measurement"], valueColumn:"_value")
+  |> keep(columns: ["_time","boat","LATITUDE_GPS_unk","LONGITUDE_GPS_unk"])
+  |> sort(columns: ["_time"])
+'''
+    client = get_client(cfg)
+    df = client.query_api().query_data_frame(org=cfg.org, query=flux)
+
+    if isinstance(df, list):
+        df = pd.concat(df, ignore_index=True) if df else pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["time_utc", "boat", "lat_raw", "lon_raw"])
+
+    out = df.rename(
+        columns={
+            "_time": "time_utc",
+            "LATITUDE_GPS_unk": "lat_raw",
+            "LONGITUDE_GPS_unk": "lon_raw",
+        }
+    ).copy()
+
+    out["time_utc"] = pd.to_datetime(out["time_utc"], errors="coerce")
+    if out["time_utc"].dt.tz is None:
+        out["time_utc"] = out["time_utc"].dt.tz_localize("UTC")
+    else:
+        out["time_utc"] = out["time_utc"].dt.tz_convert("UTC")
+
+    out["boat"] = out["boat"].astype(str)
+    out["lat_raw"] = pd.to_numeric(out["lat_raw"], errors="coerce")
+    out["lon_raw"] = pd.to_numeric(out["lon_raw"], errors="coerce")
+    return out.dropna(subset=["time_utc", "boat", "lat_raw", "lon_raw"]).reset_index(drop=True)
 
 
 # -----------------------
