@@ -4,3 +4,4 @@ numpy
 pydeck
 influxdb-client
 python-dotenv
+streamlit-autorefresh

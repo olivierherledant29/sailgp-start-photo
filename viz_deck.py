@@ -53,10 +53,14 @@ def offset_latlon(lat: float, lon: float, bearing: float, distance_m: float) -> 
     lat1 = math.radians(lat)
     lon1 = math.radians(lon)
 
-    lat2 = math.asin(math.sin(lat1) * math.cos(distance_m / R) +
-                     math.cos(lat1) * math.sin(distance_m / R) * math.cos(br))
-    lon2 = lon1 + math.atan2(math.sin(br) * math.sin(distance_m / R) * math.cos(lat1),
-                             math.cos(distance_m / R) - math.sin(lat1) * math.sin(lat2))
+    lat2 = math.asin(
+        math.sin(lat1) * math.cos(distance_m / R)
+        + math.cos(lat1) * math.sin(distance_m / R) * math.cos(br)
+    )
+    lon2 = lon1 + math.atan2(
+        math.sin(br) * math.sin(distance_m / R) * math.cos(lat1),
+        math.cos(distance_m / R) - math.sin(lat1) * math.sin(lat2),
+    )
     return (math.degrees(lat2), (math.degrees(lon2) + 540.0) % 360.0 - 180.0)
 
 
@@ -112,11 +116,12 @@ def build_vector_layers(boats_df: pd.DataFrame) -> tuple[pdk.Layer, pdk.Layer, p
     df["lon2"] = ends[1]
     df["path"] = df.apply(lambda r: [[r["lon"], r["lat"]], [r["lon2"], r["lat2"]]], axis=1)
 
+    # Cercles bateaux réduits (~ -30%)
     base_layer = pdk.Layer(
         "ScatterplotLayer",
         data=df,
         get_position='[lon, lat]',
-        get_radius=10,
+        get_radius=7,
         get_fill_color="color",
         pickable=True,
     )
@@ -173,23 +178,18 @@ def build_boat_label_layer_name_ttk_only(boats_df: pd.DataFrame) -> pdk.Layer:
 
 
 def build_cross_layer(cross_df: pd.DataFrame) -> pdk.Layer:
-    """
-    cross_df: columns boat, lat, lon, color (list[int])
-    """
     df = cross_df.dropna(subset=["lat", "lon"]).copy()
     if df.empty:
-        # couche vide (évite erreurs)
         return pdk.Layer("ScatterplotLayer", data=pd.DataFrame({"lat": [], "lon": []}), get_position='[lon, lat]')
 
     if "color" not in df.columns:
         df["color"] = df["boat"].astype(str).apply(color_for_boat)
 
-    # cercle visible et stable (contrairement au glyph "✕")
     return pdk.Layer(
         "ScatterplotLayer",
         data=df,
         get_position='[lon, lat]',
-        get_radius=6,            # plus gros que boat point
+        get_radius=6,
         get_fill_color="color",
         get_line_color=[0, 0, 0],
         line_width_min_pixels=1,
@@ -197,14 +197,30 @@ def build_cross_layer(cross_df: pd.DataFrame) -> pdk.Layer:
     )
 
 
+def build_cross_label_layer(cross_df: pd.DataFrame) -> pdk.Layer:
+    df = cross_df.dropna(subset=["lat", "lon"]).copy()
+    if df.empty or "label" not in df.columns:
+        return pdk.Layer("TextLayer", data=pd.DataFrame({"lat": [], "lon": [], "label": []}), get_position='[lon, lat]')
+
+    if "color" not in df.columns:
+        df["color"] = df["boat"].astype(str).apply(color_for_boat)
+
+    return pdk.Layer(
+        "TextLayer",
+        data=df,
+        get_position='[lon, lat]',
+        get_text="label",
+        get_size=11,
+        get_color="color",
+        get_alignment_baseline="'top'",
+        get_text_anchor="'middle'",
+        get_pixel_offset=[0, 16],
+        pickable=False,
+    )
+
+
 def build_trace_layer(trace_df: pd.DataFrame) -> pdk.Layer:
-    """
-    trace_df attendu:
-      - columns: boat, path, color
-      - path: liste [[lon,lat], [lon,lat], ...]
-    """
-    df = trace_df.copy()
-    df = df.dropna(subset=["path"])
+    df = trace_df.dropna(subset=["path"]).copy()
     if df.empty:
         return pdk.Layer("PathLayer", data=pd.DataFrame({"path": []}), get_path="path")
 
@@ -215,12 +231,55 @@ def build_trace_layer(trace_df: pd.DataFrame) -> pdk.Layer:
         "PathLayer",
         data=df,
         get_path="path",
-        get_width=1,                 # fin/discret
+        get_width=1,
         width_min_pixels=1,
         get_color="color",
         pickable=False,
     )
 
+
+def build_boundary_outline_layers(boundary_df: pd.DataFrame) -> list[pdk.Layer]:
+    """
+    Contour violet uniquement, multi-rings via colonne 'ring'.
+    boundary_df: colonnes ring, lat, lon (degrees)
+    """
+    if boundary_df is None or boundary_df.empty:
+        return []
+
+    df = boundary_df.dropna(subset=["lat", "lon"]).copy()
+
+    # si pas de colonne ring, on considère ring unique
+    if "ring" not in df.columns:
+        df["ring"] = 0
+
+    data = []
+    for ring_id, g in df.groupby("ring", sort=True):
+        g2 = g.copy()
+        # garder l'ordre d'origine autant que possible; si seq existe, trier
+        if "seq" in g2.columns:
+            g2 = g2.sort_values("seq")
+
+        path = g2[["lon", "lat"]].astype(float).values.tolist()
+        if len(path) < 2:
+            continue
+        if path[0] != path[-1]:
+            path = path + [path[0]]
+
+        data.append({"ring": int(ring_id), "path": path})
+
+    if not data:
+        return []
+
+    layer = pdk.Layer(
+        "PathLayer",
+        data=data,
+        get_path="path",
+        get_color=[138, 43, 226, 230],
+        get_width=2,
+        width_min_pixels=2,
+        pickable=False,
+    )
+    return [layer]
 
 
 def build_deck(
@@ -228,7 +287,9 @@ def build_deck(
     marks_df: pd.DataFrame,
     cross_df: pd.DataFrame | None = None,
     trace_df: pd.DataFrame | None = None,
+    boundary_df: pd.DataFrame | None = None,
 ) -> pdk.Deck:
+
     pts = pd.concat(
         [boats_df[["lat", "lon"]].copy(), marks_df[["lat", "lon"]].copy()],
         ignore_index=True,
@@ -237,7 +298,10 @@ def build_deck(
     if cross_df is not None and not cross_df.empty:
         pts = pd.concat([pts, cross_df[["lat", "lon"]].copy()], ignore_index=True).dropna()
 
-    # (optionnel) pas besoin d'ajouter la trace au centrage — elle suit déjà les bateaux
+    if boundary_df is not None and not boundary_df.empty:
+        bpts = boundary_df[["lat", "lon"]].copy()
+        pts = pd.concat([pts, bpts], ignore_index=True).dropna()
+
     if pts.empty:
         center_lat, center_lon = 0.0, 0.0
     else:
@@ -249,17 +313,18 @@ def build_deck(
     base_layer, path_layer, head_layer = build_vector_layers(boats_df)
     boat_labels = build_boat_label_layer_name_ttk_only(boats_df)
 
-    layers = []
+    layers: list[pdk.Layer] = []
 
-    # Trace (discrète) sous les autres éléments
     if trace_df is not None and not trace_df.empty:
         layers.append(build_trace_layer(trace_df))
 
-    # Vecteurs bateaux
+    if boundary_df is not None and not boundary_df.empty:
+        layers += build_boundary_outline_layers(boundary_df)
+
     layers += [path_layer, head_layer, base_layer, boat_labels, buoy_points, buoy_labels]
 
-    # Cross points au-dessus
     if cross_df is not None and not cross_df.empty:
+        layers.insert(0, build_cross_label_layer(cross_df))
         layers.insert(0, build_cross_layer(cross_df))
 
     view_state = pdk.ViewState(
@@ -278,5 +343,3 @@ def build_deck(
         tooltip=tooltip,
         map_style=CARTO_POSITRON,
     )
-
-

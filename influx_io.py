@@ -367,3 +367,28 @@ def detect_starts_from_race_start_count(df_count: pd.DataFrame) -> pd.DataFrame:
     hits = hits[["detected_time_utc", "count_before", "count_after"]].reset_index(drop=True)
     hits["start_index"] = np.arange(1, len(hits) + 1, dtype=int)
     return hits[["start_index", "detected_time_utc", "count_before", "count_after"]]
+
+
+@st.cache_data(show_spinner=False, ttl=1)
+def load_fra_tts_ttk_at_time(cfg: InfluxCfg, t_utc: datetime) -> dict[str, float]:
+    """
+    Retourne TTS_s et TTK_s (mean 1s) autour de t_utc pour FRA.
+    """
+    if t_utc.tzinfo is None:
+        t_utc = t_utc.replace(tzinfo=timezone.utc)
+    else:
+        t_utc = t_utc.astimezone(timezone.utc)
+
+    start_dt = t_utc - timedelta(seconds=1)
+    stop_dt = t_utc + timedelta(seconds=1)
+
+    def _get(meas: str) -> float:
+        df = query_mean_by_boat(cfg, meas, ["FRA"], start_dt, stop_dt, "strm|mdss|mdss_fast|raw")
+        if df.empty:
+            return float("nan")
+        return float(df["value"].iloc[0])
+
+    return {
+        "TTS_s": _get("PC_TTS_s"),
+        "TTK_s": _get("PC_TTK_s"),
+    }
