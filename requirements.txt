@@ -6,4 +6,4 @@ influxdb-client
 python-dotenv
 streamlit-autorefresh
 shapely
-
+pyproj
