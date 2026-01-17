@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, date, time, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta
 import numpy as np
 import pandas as pd
 import streamlit as st
+import time
+
 
 try:
     from dotenv import load_dotenv
@@ -13,73 +15,57 @@ except Exception:
 
 from influx_io import (
     get_cfg,
-    load_race_start_count_day_fra,
-    detect_starts_from_race_start_count,
-    load_boat_snapshot,
-    load_marks_snapshot,
-    load_avg_fleet_vector_mean_displacement,
-    load_latlon_timeseries_1s,
     scale_latlon_always,
     ALL_BOATS,
+    load_boat_snapshot,
+    load_marks_snapshot,
+    load_trace_boat,
+    load_race_start_count_day_fra,
+    detect_starts_from_race_start_count,
+    load_twd_tws_fra,
+    load_latlon_timeseries_1s,  # IMPORTANT: pour AVG trace + crossing
 )
 
-from viz_deck import build_deck, color_for_boat
-from xml_boundary import parse_course_limit_xml
+from viz_deck import build_deck
+
+try:
+    from boundary_shared import sidebar_boundary_uploader
+except Exception:
+    sidebar_boundary_uploader = None
 
 
-def round_start_time(dt_utc: datetime, mode: str) -> datetime:
-    ts = pd.Timestamp(dt_utc).tz_convert("UTC")
-    if mode == "Aucun":
-        return ts.to_pydatetime()
-    if mode == "Minute la plus proche":
-        return (ts + pd.Timedelta(seconds=30)).floor("min").to_pydatetime()
-    if mode == "Minute floor":
-        return ts.floor("min").to_pydatetime()
-    return ts.to_pydatetime()
+def _to_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
-def add_avg_fleet_barycenter_with_vector(
-    boats_df_deg: pd.DataFrame,
-    avg_vec_bearing_deg: float,
-    avg_vec_dist_m: float,
-    avg_filter: str,
-) -> pd.DataFrame:
-    df = boats_df_deg.copy()
-    eligible = df[df["boat"] != "FRA"].copy()
-
-    if avg_filter == "only port":
-        eligible = eligible[pd.to_numeric(eligible["TWA_deg"], errors="coerce") < 0].copy()
-
-    if eligible.empty:
-        return df
-
-    avg = {
-        "boat": "AVG_fleet",
-        "lat": float(pd.to_numeric(eligible["lat"], errors="coerce").mean()),
-        "lon": float(pd.to_numeric(eligible["lon"], errors="coerce").mean()),
-        "BSP_kmph": float(pd.to_numeric(eligible.get("BSP_kmph"), errors="coerce").mean()),
-        "TWA_deg": float(pd.to_numeric(eligible.get("TWA_deg"), errors="coerce").mean()),
-        "TWD_deg": float(pd.to_numeric(eligible.get("TWD_deg"), errors="coerce").mean()),
-        "COG_deg": float(pd.to_numeric(eligible.get("COG_deg"), errors="coerce").mean()),
-        "TTK_s": float(pd.to_numeric(eligible.get("TTK_s"), errors="coerce").mean()),
-        "TTS_s": float(pd.to_numeric(eligible.get("TTS_s"), errors="coerce").mean()),
-        "START_RATIO": float(pd.to_numeric(eligible.get("START_RATIO"), errors="coerce").mean()),
-        "AVG_VEC_BEARING_deg": float(avg_vec_bearing_deg),
-        "AVG_VEC_DIST_m": float(avg_vec_dist_m),
-    }
-
-    avg_row = pd.DataFrame([avg])
-    for c in df.columns:
-        if c not in avg_row.columns:
-            avg_row[c] = np.nan
-    for c in avg_row.columns:
-        if c not in df.columns:
-            df[c] = np.nan
-
-    avg_row = avg_row[df.columns]
-    return pd.concat([df, avg_row], ignore_index=True)
+def _round_to_nearest_minute(dt: datetime) -> datetime:
+    dt = _to_utc(dt)
+    sec = dt.second + dt.microsecond / 1e6
+    if sec >= 30:
+        dt = dt + timedelta(minutes=1)
+    return dt.replace(second=0, microsecond=0)
 
 
+def _vector_from_positions(lat0, lon0, lat1, lon1):
+    if not np.isfinite([lat0, lon0, lat1, lon1]).all():
+        return np.nan, np.nan
+
+    m_per_deg_lat = 111_320.0
+    m_per_deg_lon = 111_320.0 * float(np.cos(np.deg2rad((lat0 + lat1) * 0.5)))
+
+    dx = (lon1 - lon0) * m_per_deg_lon
+    dy = (lat1 - lat0) * m_per_deg_lat
+    dist = float(np.sqrt(dx * dx + dy * dy))
+    bearing = float((np.degrees(np.arctan2(dx, dy)) + 360.0) % 360.0)
+    return bearing, dist
+
+
+# -------------------------------
+# Crossing SL1-SL2 (G -> D)
+# (repris de ta version ancienne)
+# -------------------------------
 def _enu_meters(lat: np.ndarray, lon: np.ndarray, lat0: float, lon0: float) -> tuple[np.ndarray, np.ndarray]:
     m_per_deg_lat = 111_320.0
     m_per_deg_lon = 111_320.0 * np.cos(np.deg2rad(lat0))
@@ -135,266 +121,294 @@ def last_left_to_right_crossing(
     return {"time_utc": pd.Timestamp(tn).tz_localize("UTC"), "lat": lat_cross, "lon": lon_cross, "dist_sl2_m": yr_cross}
 
 
-def make_path(df_track: pd.DataFrame) -> list[list[float]]:
-    g = df_track.dropna(subset=["lat", "lon"]).sort_values("time_utc")
-    if g.empty:
-        return []
-    return g[["lon", "lat"]].astype(float).values.tolist()
-
-
-def manual_start_time_controls(day_utc: date) -> datetime:
-    """
-    Start time manuel UX améliorée:
-      - Saisie clavier via time_input
-      - OU menus déroulants heure/minute (toutes les minutes)
-    """
-    st.caption("Manuel: saisir heure+minute au clavier (ou via menus).")
-    mode = st.radio("Saisie heure", ["Clavier (time input)", "Menus (HH / MM)"], horizontal=True, index=0)
-
-    if mode.startswith("Clavier"):
-        t_val = st.time_input("Heure (UTC)", value=time(10, 17), step=60)
-        return datetime.combine(day_utc, t_val).replace(tzinfo=timezone.utc)
-
-    # Menus
-    hh = st.selectbox("Heure (UTC)", list(range(0, 24)), index=10)
-    mm = st.selectbox("Minute (UTC)", list(range(0, 60)), index=17)
-    return datetime.combine(day_utc, time(hh, mm, 0)).replace(tzinfo=timezone.utc)
-
-
-def main():
-    st.set_page_config(page_title="Replay", layout="wide")
-    st.title("SailGP – Replay (RACE_START_COUNT FRA)")
+def render_start_photo(page_title: str = "SailGP – Replay (RACE_START_COUNT FRA)", mode_override: str | None = None):
+    st.title(page_title)
 
     cfg = get_cfg()
 
-    # Sidebar: day + mode + start selection early
     with st.sidebar:
-        st.header("1) Journée (UTC)")
-        day = st.date_input("Jour (UTC)", value=datetime.now(timezone.utc).date())
+        st.header("Module principal (Start Photo)")
 
+        if mode_override is None:
+            mode = st.radio("Mode", ["Replay", "Live"], horizontal=True)
+        else:
+            mode = mode_override
+
+        boundary_df = None
+        if sidebar_boundary_uploader is not None:
+            st.markdown(
+                "<div style='padding:6px;border-radius:8px;border:1px solid #999;background:#f5f5f5;'><b>XML Boundary (commun)</b></div>",
+                unsafe_allow_html=True,
+            )
+            boundary_df = sidebar_boundary_uploader()
+
+
+
+
+        if mode == "Replay":
+            day = st.date_input("Jour (UTC)", value=date(2025, 11, 30))
+
+            df_cnt = load_race_start_count_day_fra(cfg, day)
+            df_starts = detect_starts_from_race_start_count(df_cnt)
+
+            round_minute = st.checkbox("Arrondir à la minute UTC la plus proche", value=True)
+
+            starts_list = []
+            if not df_starts.empty:
+                for _, r in df_starts.iterrows():
+                    t0 = pd.to_datetime(r["detected_time_utc"]).to_pydatetime()
+                    t0 = _to_utc(t0)
+                    if round_minute:
+                        t0 = _round_to_nearest_minute(t0)
+                    label = f"start {int(r['start_index'])} – {t0.strftime('%H:%M:%S')}Z"
+                    starts_list.append((label, t0))
+
+            st.subheader("Départ détecté")
+            if starts_list:
+                label = st.selectbox("Choix départ", [x[0] for x in starts_list], index=0)
+                start_time = dict(starts_list)[label]
+            else:
+                st.info("Aucun départ détecté (RACE_START_COUNT). Utilise le départ manuel.")
+                start_time = None
+
+            st.subheader("Départ manuel")
+            manual_dt = st.text_input("Heure UTC (YYYY-MM-DD HH:MM)", value=f"{day.isoformat()} 10:17")
+            manual_use = st.checkbox("Utiliser départ manuel", value=(start_time is None))
+
+            if manual_use:
+                try:
+                    start_time = datetime.strptime(manual_dt.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+                except Exception:
+                    st.error("Format invalide. Exemple: 2025-11-30 10:17")
+                    st.stop()
+
+            offset_s = st.slider("Temps relatif au départ (s)", -180, 120, -70, step=1)
+
+        else:
+            now = datetime.now(timezone.utc)  #- timedelta(hours=10)  # UTC-7 pour SailGP Live
+            st.write(f"Heure UTC actuelle: **{now.strftime('%H:%M:%S')}Z**")
+
+            auto = st.radio("Départ live", ["Auto (now + TTS FRA)", "Manuel (minute)"], horizontal=False)
+            offset_s = st.slider("Offset affichage (s)", -180, 120, -70, step=1)
+
+            if auto.startswith("Auto"):
+                snap_now = load_boat_snapshot(cfg, now, 0, half_window_s=2)
+                snap_now = scale_latlon_always(snap_now, "lat", "lon")
+                fra = snap_now[snap_now["boat"] == "FRA"]
+                tts = float(fra["TTS_s"].iloc[0]) if (not fra.empty and pd.notna(fra["TTS_s"].iloc[0])) else np.nan
+                st.write(f"TTS FRA: **{tts:.1f}s**")
+                if not np.isfinite(tts):
+                    st.error("TTS FRA indisponible, passe en départ manuel.")
+                    st.stop()
+                start_time = now + timedelta(seconds=float(tts))
+                start_time = start_time.replace(microsecond=0)
+                st.write(f"Start estimé: **{start_time.strftime('%H:%M:%S')}Z**")
+            else:
+                minute = st.number_input("Minute du prochain départ (0-59)", 0, 59, 16, step=1)
+                start_hour = now.replace(second=0, microsecond=0, minute=int(minute))
+                if start_hour < now:
+                    start_hour += timedelta(hours=1)
+                start_time = start_hour
+                st.write(f"Start manuel: **{start_time.strftime('%H:%M:%S')}Z**")
+
+        # --- NEW: filtre bateaux pour AVG_fleet (point + trace + crossing)
         st.divider()
-        st.header("2) Départ")
-        mode = st.radio("Mode départ", ["Auto (RACE_START_COUNT FRA)", "Manuel (heure UTC)"], index=0)
-
-    start_time: datetime | None = None
-    detected_info = None
-    detected_time_raw = None
-    round_mode = "Aucun"
-
-    if mode.startswith("Auto"):
-        with st.spinner("Lecture RACE_START_COUNT_unk (FRA), mean 1s, détection incréments..."):
-            df_count = load_race_start_count_day_fra(cfg, day)
-            df_starts = detect_starts_from_race_start_count(df_count)
-
-        if df_starts.empty:
-            st.warning("Aucun départ détecté via RACE_START_COUNT_unk (FRA) sur cette journée.")
-            with st.expander("Debug – RACE_START_COUNT (FRA)", expanded=False):
-                st.dataframe(df_count.head(1500), use_container_width=True)
-            st.stop()
-
-        labels = []
-        for _, r in df_starts.iterrows():
-            t = pd.Timestamp(r["detected_time_utc"]).tz_convert("UTC").strftime("%H:%M:%S")
-            labels.append(f"start {int(r['start_index'])}, {t} (Δ={r['count_before']:.0f}→{r['count_after']:.0f})")
-
-        with st.sidebar:
-            # demandé: juste sous le jour
-            choice = st.selectbox("Choisir le départ détecté", labels, index=0)
-            round_mode = st.selectbox("Arrondi (Auto)", ["Aucun", "Minute la plus proche", "Minute floor"], index=0)
-
-        chosen_idx = labels.index(choice)
-        detected_time_raw = (
-            pd.Timestamp(df_starts.loc[chosen_idx, "detected_time_utc"])
-            .tz_convert("UTC")
-            .to_pydatetime()
-            .replace(tzinfo=timezone.utc)
+        st.subheader("AVG_fleet — Filtre bateaux")
+        candidates = [b for b in ALL_BOATS if b != "FRA"]
+        excluded = st.multiselect(
+            "Exclure du calcul AVG_fleet",
+            options=candidates,
+            default=[],
         )
-        start_time = round_start_time(detected_time_raw, round_mode).replace(tzinfo=timezone.utc)
-        detected_info = df_starts.loc[chosen_idx].to_dict()
 
-    else:
-        with st.sidebar:
-            start_time = manual_start_time_controls(day)
+    start_time = _to_utc(start_time)
 
-    # Rest of controls
-    with st.sidebar:
-        st.divider()
-        st.header("3) Temps relatif au départ")
-        offset_s = st.slider("Offset (s) relatif au départ", min_value=-180, max_value=120, value=-70, step=1)
-        st.caption("Snapshot: centre ± 5 s (10 s total)")
+    # Snapshot at t and t-1s
+    boats_now = load_boat_snapshot(cfg, start_time, offset_s, half_window_s=1)
+    boats_prev = load_boat_snapshot(cfg, start_time, offset_s - 1, half_window_s=1)
+    marks = load_marks_snapshot(cfg, start_time, offset_s, half_window_s=2)
 
-        st.divider()
-        st.header("4) Options")
-        compute_cross = st.checkbox("Calculer dernier franchissement SL1–SL2", value=True)
+    boats_now = scale_latlon_always(boats_now, "lat", "lon")
+    boats_prev = scale_latlon_always(boats_prev, "lat", "lon")
+    marks = scale_latlon_always(marks, "lat", "lon")
 
-        avg_filter_ui = st.selectbox("Barycentre AVG_fleet", ["ALL except FRA", "only port"], index=0)
-        avg_filter = "ALL except FRA" if avg_filter_ui.startswith("ALL") else "only port"
+    def _color(boat: str):
+        if boat == "FRA":
+            return [0, 100, 255, 230]
+        if boat == "AVG_fleet":
+            return [220, 30, 30, 230]
+        return [120, 120, 120, 120]
 
-        st.divider()
-        st.header("5) Boundary XML")
-        xml_file = st.file_uploader("Boundary XML (CourseLimit)", type=["xml"], accept_multiple_files=False)
+    boats = boats_now.copy()
+    boats["color"] = boats["boat"].astype(str).apply(_color)
 
-    boundary_df = pd.DataFrame(columns=["seq", "lat", "lon"])
-    if xml_file is not None:
-        boundary_df = parse_course_limit_xml(xml_file.getvalue())
+    # Vecteurs t-1 -> t (par bateau)
+    prev_map = boats_prev.set_index("boat")[["lat", "lon"]]
+    vec_bearing = []
+    vec_dist = []
+    for _, r in boats.iterrows():
+        b = str(r["boat"])
+        if b in prev_map.index and pd.notna(r["lat"]) and pd.notna(r["lon"]):
+            lat0, lon0 = prev_map.loc[b, "lat"], prev_map.loc[b, "lon"]
+            bearing, dist = _vector_from_positions(float(lat0), float(lon0), float(r["lat"]), float(r["lon"]))
+        else:
+            bearing, dist = np.nan, np.nan
+        vec_bearing.append(bearing)
+        vec_dist.append(dist)
 
-    if mode.startswith("Auto"):
-        st.subheader(
-            f"Départ auto: détecté {detected_time_raw.strftime('%H:%M:%S')}Z → utilisé {start_time.strftime('%H:%M:%S')}Z | snapshot T{offset_s:+d}s (±5s)"
-        )
-        st.caption(f"RACE_START_COUNT FRA {detected_info['count_before']:.0f} → {detected_info['count_after']:.0f}")
-    else:
-        st.subheader(f"Départ manuel: {start_time.strftime('%Y-%m-%d %H:%M:%S')}Z | snapshot T{offset_s:+d}s (±5s)")
+    boats["VEC_BEARING_deg"] = vec_bearing
+    boats["VEC_DIST_m"] = vec_dist
 
-    # Snapshot + marks + avg vector
-    with st.spinner("Chargement snapshot + vecteur AVG_fleet..."):
-        boats_df = load_boat_snapshot(cfg, start_time, offset_s=offset_s, half_window_s=5)
-        marks_df = load_marks_snapshot(cfg, start_time, offset_s=offset_s, half_window_s=5)
+    # --- Eligible codes cohérents partout
+    excluded_set = set(map(str, excluded))
+    eligible_codes = [b for b in ALL_BOATS if b != "FRA" and b not in excluded_set]
 
-        boats_df = scale_latlon_always(boats_df, "lat", "lon")
-        marks_df = scale_latlon_always(marks_df, "lat", "lon")
+    # fleet AVG (barycentre) + vecteur barycentre (sur eligible_codes)
+    fleet_now = boats_now[boats_now["boat"].isin(eligible_codes)].dropna(subset=["lat", "lon"])
+    fleet_prev = boats_prev[boats_prev["boat"].isin(eligible_codes)].dropna(subset=["lat", "lon"])
 
-        vec = load_avg_fleet_vector_mean_displacement(cfg, start_time, offset_s=offset_s, half_window_s=5, endpoint_half_window_s=1)
+    if not fleet_now.empty:
+        lat1 = float(fleet_now["lat"].mean())
+        lon1 = float(fleet_now["lon"].mean())
 
-        boats_df = add_avg_fleet_barycenter_with_vector(
-            boats_df_deg=boats_df,
-            avg_vec_bearing_deg=vec.get("bearing_deg", float("nan")),
-            avg_vec_dist_m=vec.get("distance_m", float("nan")),
-            avg_filter=avg_filter,
-        )
+        if not fleet_prev.empty:
+            lat0 = float(fleet_prev["lat"].mean())
+            lon0 = float(fleet_prev["lon"].mean())
+            b_avg, d_avg = _vector_from_positions(lat0, lon0, lat1, lon1)
+        else:
+            b_avg, d_avg = np.nan, np.nan
 
-    boats_view = boats_df[
-        [
-            "boat", "lat", "lon",
-            "BSP_kmph", "TWA_deg", "TWD_deg", "COG_deg",
-            "TTK_s", "TTS_s", "START_RATIO",
-            "AVG_VEC_BEARING_deg", "AVG_VEC_DIST_m",
-        ]
-    ].copy()
-    marks_view = marks_df[["mark", "lat", "lon"]].copy()
+        avg_row = pd.DataFrame([{
+            "boat": "AVG_fleet",
+            "lat": lat1,
+            "lon": lon1,
+            "BSP_kmph": np.nan,
+            "TTK_s": np.nan,
+            "TTS_s": np.nan,
+            "COG_deg": np.nan,
+            "color": _color("AVG_fleet"),
+            "VEC_BEARING_deg": b_avg,
+            "VEC_DIST_m": d_avg,
+        }])
+        boats = pd.concat([boats, avg_row], ignore_index=True)
 
-    # Fleet list consistent with filter
-    if avg_filter == "only port":
-        eligible_codes = boats_df.loc[
-            (boats_df["boat"] != "FRA") & (pd.to_numeric(boats_df["TWA_deg"], errors="coerce") < 0),
-            "boat",
-        ].astype(str).tolist()
-    else:
-        eligible_codes = boats_df.loc[boats_df["boat"] != "FRA", "boat"].astype(str).tolist()
+    # Trace FRA + AVG (cohérent avec le filtre)
+    trace_rows = []
+    t_abs = start_time + timedelta(seconds=int(offset_s))
 
-    # Crossing + traces
-    cross_df = pd.DataFrame(columns=["boat", "lat", "lon", "color", "label"])
-    trace_df = pd.DataFrame(columns=["boat", "path", "color"])
-    cross_info: dict[str, dict | None] = {}
+    fra_trace = load_trace_boat(cfg, "FRA", t_abs - timedelta(seconds=180), t_abs)
+    if fra_trace is not None and not fra_trace.empty:
+        path = fra_trace[["lon", "lat"]].values.tolist()
+        trace_rows.append({"path": path, "color": [0, 100, 255, 160]})
 
-    if compute_cross:
-        sl1 = marks_view.loc[marks_view["mark"] == "SL1"].dropna().head(1)
-        sl2 = marks_view.loc[marks_view["mark"] == "SL2"].dropna().head(1)
+    if eligible_codes:
+        fleet_ts = load_latlon_timeseries_1s(cfg, eligible_codes, t_abs - timedelta(seconds=180), t_abs)
+        if fleet_ts is not None and not fleet_ts.empty:
+            fleet_ts["lat"] = pd.to_numeric(fleet_ts["lat_raw"], errors="coerce") / 1e7
+            fleet_ts["lon"] = pd.to_numeric(fleet_ts["lon_raw"], errors="coerce") / 1e7
+            avg_track = (
+                fleet_ts.dropna(subset=["time_utc", "lat", "lon"])
+                .groupby("time_utc", as_index=False)[["lat", "lon"]]
+                .mean(numeric_only=True)
+                .sort_values("time_utc")
+                .reset_index(drop=True)
+            )
+            if not avg_track.empty:
+                path_avg = avg_track[["lon", "lat"]].astype(float).values.tolist()
+                trace_rows.append({"path": path_avg, "color": [220, 30, 30, 160]})
 
-        if not sl1.empty and not sl2.empty:
-            sl1_lat, sl1_lon = float(sl1["lat"].iloc[0]), float(sl1["lon"].iloc[0])
-            sl2_lat, sl2_lon = float(sl2["lat"].iloc[0]), float(sl2["lon"].iloc[0])
+    trace_df = pd.DataFrame(trace_rows)
 
-            t_start = start_time - timedelta(seconds=180)
-            t_end = start_time + timedelta(seconds=int(offset_s))
+    # Crossing FRA + AVG_fleet (G -> D)
+    cross_rows = []
+    sl1 = marks.loc[marks["mark"] == "SL1"].dropna(subset=["lat", "lon"]).head(1)
+    sl2 = marks.loc[marks["mark"] == "SL2"].dropna(subset=["lat", "lon"]).head(1)
 
-            if t_end > t_start:
-                # FRA track
-                fra_ts = load_latlon_timeseries_1s(cfg, ["FRA"], t_start, t_end)
-                fra_ts["lat"] = fra_ts["lat_raw"] / 1e7
-                fra_ts["lon"] = fra_ts["lon_raw"] / 1e7
-                fra_track = fra_ts[["time_utc", "lat", "lon"]].copy()
-                fra_cross = last_left_to_right_crossing(fra_track, sl1_lat, sl1_lon, sl2_lat, sl2_lon)
+    if not sl1.empty and not sl2.empty:
+        sl1_lat, sl1_lon = float(sl1["lat"].iloc[0]), float(sl1["lon"].iloc[0])
+        sl2_lat, sl2_lon = float(sl2["lat"].iloc[0]), float(sl2["lon"].iloc[0])
 
-                # AVG track
-                if eligible_codes:
-                    fleet_ts = load_latlon_timeseries_1s(cfg, eligible_codes, t_start, t_end)
-                    if not fleet_ts.empty:
-                        fleet_ts["lat"] = fleet_ts["lat_raw"] / 1e7
-                        fleet_ts["lon"] = fleet_ts["lon_raw"] / 1e7
-                        avg_track = (
-                            fleet_ts.groupby("time_utc", as_index=False)[["lat", "lon"]]
-                            .mean(numeric_only=True)
-                            .sort_values("time_utc")
-                            .reset_index(drop=True)
-                        )
-                    else:
-                        avg_track = pd.DataFrame(columns=["time_utc", "lat", "lon"])
-                else:
-                    avg_track = pd.DataFrame(columns=["time_utc", "lat", "lon"])
+        t_start = t_abs - timedelta(seconds=180)
+        t_end = t_abs
 
+        # FRA track via load_trace_boat (déjà en degrés)
+        if fra_trace is not None and not fra_trace.empty:
+            fra_track = fra_trace[["time_utc", "lat", "lon"]].copy()
+            fra_cross = last_left_to_right_crossing(fra_track, sl1_lat, sl1_lon, sl2_lat, sl2_lon)
+            if fra_cross is not None:
+                # TTI = start_time - crossing_time (comme ton ancienne version)
+                tti = (start_time - fra_cross["time_utc"].to_pydatetime()).total_seconds()
+                cross_rows.append({
+                    "boat": "FRA",
+                    "lat": float(fra_cross["lat"]),
+                    "lon": float(fra_cross["lon"]),
+                    "color": [0, 100, 255, 230],
+                    "label": f"{tti:.0f}s / {fra_cross['dist_sl2_m']:.0f}m",
+                })
+
+        # AVG track déjà calculé ci-dessus si eligible_codes
+        if eligible_codes:
+            fleet_ts = load_latlon_timeseries_1s(cfg, eligible_codes, t_start, t_end)
+            if fleet_ts is not None and not fleet_ts.empty:
+                fleet_ts["lat"] = pd.to_numeric(fleet_ts["lat_raw"], errors="coerce") / 1e7
+                fleet_ts["lon"] = pd.to_numeric(fleet_ts["lon_raw"], errors="coerce") / 1e7
+                avg_track = (
+                    fleet_ts.dropna(subset=["time_utc", "lat", "lon"])
+                    .groupby("time_utc", as_index=False)[["lat", "lon"]]
+                    .mean(numeric_only=True)
+                    .sort_values("time_utc")
+                    .reset_index(drop=True)
+                )
                 avg_cross = last_left_to_right_crossing(avg_track, sl1_lat, sl1_lon, sl2_lat, sl2_lon)
+                if avg_cross is not None:
+                    tti = (start_time - avg_cross["time_utc"].to_pydatetime()).total_seconds()
+                    cross_rows.append({
+                        "boat": "AVG_fleet",
+                        "lat": float(avg_cross["lat"]),
+                        "lon": float(avg_cross["lon"]),
+                        "color": [220, 30, 30, 230],
+                        "label": f"{tti:.0f}s / {avg_cross['dist_sl2_m']:.0f}m",
+                    })
 
-                def fmt_result(cross: dict | None) -> dict | None:
-                    if cross is None:
-                        return None
-                    tti = (start_time - cross["time_utc"].to_pydatetime()).total_seconds()
-                    return {
-                        "TTI_s": float(tti),
-                        "dist_sl2_m": float(cross["dist_sl2_m"]),
-                        "time_utc": cross["time_utc"],
-                        "lat": float(cross["lat"]),
-                        "lon": float(cross["lon"]),
-                    }
+    cross_df = pd.DataFrame(cross_rows, columns=["boat", "lat", "lon", "color", "label"])
 
-                cross_info["FRA"] = fmt_result(fra_cross)
-                cross_info["AVG_fleet"] = fmt_result(avg_cross)
+    # TWD/TWS FRA (affichage)
+    tw = load_twd_tws_fra(cfg, start_time, offset_s, half_window_s=2)
+    if tw:
+        st.caption(
+            f"TWD FRA: {tw.get('TWD_MHU_SGP_deg', float('nan')):.1f}° — "
+            f"TWS FRA: {tw.get('TWS_MHU_SGP_km_h_1', float('nan')):.1f} km/h"
+        )
 
-                rows_c = []
-                for boat in ["FRA", "AVG_fleet"]:
-                    r = cross_info.get(boat)
-                    if r is None:
-                        continue
-                    label = f"{r['TTI_s']:.0f}s / {r['dist_sl2_m']:.0f}m"
-                    rows_c.append(
-                        {"boat": boat, "lat": r["lat"], "lon": r["lon"], "color": color_for_boat(boat), "label": label}
-                    )
-                cross_df = pd.DataFrame(rows_c)
-
-                # Traces
-                fra_path = make_path(fra_track)
-                avg_path = make_path(avg_track)
-                rows_t = []
-                if fra_path:
-                    rows_t.append({"boat": "FRA", "path": fra_path, "color": color_for_boat("FRA")})
-                if avg_path:
-                    rows_t.append({"boat": "AVG_fleet", "path": avg_path, "color": color_for_boat("AVG_fleet")})
-                trace_df = pd.DataFrame(rows_t)
-
-    # Info box
-    if compute_cross:
-        c1, c2 = st.columns([1, 3])
-        with c1:
-            st.markdown("**Dernier franchissement SL1–SL2 (G→D)**")
-            for boat in ["FRA", "AVG_fleet"]:
-                r = cross_info.get(boat)
-                if r is None:
-                    st.write(f"{boat}: n/a")
-                else:
-                    st.write(f"{boat}: TTI={r['TTI_s']:.1f}s | dSL2={r['dist_sl2_m']:.0f}m")
-        with c2:
-            st.write("")
-
-    # Map
-    st.pydeck_chart(
-        build_deck(
-            boats_view,
-            marks_view,
-            cross_df=cross_df,
-            trace_df=trace_df,
-            boundary_df=boundary_df,
-        ),
-        use_container_width=True,
+    deck = build_deck(
+        boats_df=boats,
+        marks_df=marks,
+        cross_df=cross_df,
+        trace_df=trace_df,
+        boundary_df=boundary_df,
     )
+    st.pydeck_chart(deck, width="stretch")
 
-    with st.expander("Debug – boundary", expanded=False):
-        st.dataframe(boundary_df.head(200), use_container_width=True)
 
-    if compute_cross:
-        with st.expander("Debug – crossings/traces", expanded=False):
-            st.write(cross_info)
-            st.dataframe(cross_df, use_container_width=True)
-            st.dataframe(trace_df, use_container_width=True)
+
+
+    return {
+        "boats": boats,
+        "marks": marks,
+        "boundary": boundary_df,
+        "start_time": start_time,
+        "offset_s": offset_s,
+        "cfg": cfg,
+        "mode": mode,
+        "eligible_codes": eligible_codes,
+        "cross_df": cross_df,
+        "trace_df": trace_df,
+    }
+
+
+def main():
+    st.set_page_config(page_title="SailGP – Start Photo", layout="wide")
+    render_start_photo(page_title="SailGP – Start Photo")
 
 
 if __name__ == "__main__":

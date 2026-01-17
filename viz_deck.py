@@ -5,281 +5,256 @@ import numpy as np
 import pandas as pd
 import pydeck as pdk
 
-CARTO_POSITRON = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
+CARTO_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
 
 
-def color_for_buoy(mark: str) -> list[int]:
-    if mark in ("SL1", "SL2"):
-        return [255, 105, 180]  # rose
-    if mark == "M1":
-        return [255, 215, 0]    # jaune
-    return [200, 200, 200]
+def _safe_mean(series: pd.Series, default=0.0) -> float:
+    v = pd.to_numeric(series, errors="coerce")
+    return float(v.mean()) if v.notna().any() else float(default)
 
 
-def color_for_boat(boat: str) -> list[int]:
-    if boat == "FRA":
-        return [30, 144, 255]   # bleu
-    if boat == "AVG_fleet":
-        return [255, 0, 0]      # rouge
-    return [80, 80, 80]
-
-
-def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dlon = math.radians(lon2 - lon1)
-    y = math.sin(dlon) * math.cos(phi2)
-    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlon)
-    return float((math.degrees(math.atan2(y, x)) + 360.0) % 360.0)
-
-
-def compute_map_bearing_to_align_sl1_sl2(marks_df: pd.DataFrame) -> float:
-    sl1 = marks_df.loc[marks_df["mark"] == "SL1"].head(1)
-    sl2 = marks_df.loc[marks_df["mark"] == "SL2"].head(1)
+def bearing_sl1_sl2(marks_df: pd.DataFrame) -> float:
+    sl1 = marks_df.loc[marks_df["mark"] == "SL1"]
+    sl2 = marks_df.loc[marks_df["mark"] == "SL2"]
     if sl1.empty or sl2.empty:
         return 0.0
 
-    lat_sl2, lon_sl2 = float(sl2["lat"].iloc[0]), float(sl2["lon"].iloc[0])
-    lat_sl1, lon_sl1 = float(sl1["lat"].iloc[0]), float(sl1["lon"].iloc[0])
-    if not np.isfinite([lat_sl2, lon_sl2, lat_sl1, lon_sl1]).all():
-        return 0.0
+    lat1, lon1 = float(sl1.iloc[0]["lat"]), float(sl1.iloc[0]["lon"])
+    lat2, lon2 = float(sl2.iloc[0]["lat"]), float(sl2.iloc[0]["lon"])
 
-    return float(bearing_deg(lat_sl2, lon_sl2, lat_sl1, lon_sl1) % 360.0)
-
-
-def offset_latlon(lat: float, lon: float, bearing: float, distance_m: float) -> tuple[float, float]:
-    R = 6371000.0
-    br = math.radians(bearing)
-    lat1 = math.radians(lat)
-    lon1 = math.radians(lon)
-
-    lat2 = math.asin(
-        math.sin(lat1) * math.cos(distance_m / R)
-        + math.cos(lat1) * math.sin(distance_m / R) * math.cos(br)
-    )
-    lon2 = lon1 + math.atan2(
-        math.sin(br) * math.sin(distance_m / R) * math.cos(lat1),
-        math.cos(distance_m / R) - math.sin(lat1) * math.sin(lat2),
-    )
-    return (math.degrees(lat2), (math.degrees(lon2) + 540.0) % 360.0 - 180.0)
+    dy = lat1 - lat2
+    dx = (lon1 - lon2) * math.cos(math.radians((lat1 + lat2) * 0.5))
+    return (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
 
 
-def build_buoy_layers(marks_df: pd.DataFrame) -> tuple[pdk.Layer, pdk.Layer]:
+def build_marks_layers(marks_df: pd.DataFrame):
     df = marks_df.dropna(subset=["lat", "lon"]).copy()
-    df["color"] = df["mark"].astype(str).apply(color_for_buoy)
+    if df.empty:
+        return []
 
-    points = pdk.Layer(
-        "ScatterplotLayer",
-        data=df,
-        get_position='[lon, lat]',
-        get_radius=14,
-        get_fill_color="color",
-        pickable=True,
-    )
+    def color(mark):
+        if mark in ("SL1", "SL2"):
+            return [255, 105, 180, 230]
+        if mark == "M1":
+            return [255, 255, 0, 230]
+        return [160, 160, 160, 200]
 
-    labels = pdk.Layer(
-        "TextLayer",
-        data=df,
-        get_position='[lon, lat]',
-        get_text="mark",
-        get_size=14,
-        get_alignment_baseline="'bottom'",
-        get_text_anchor="'middle'",
-        get_color=[20, 20, 20],
-        pickable=False,
-    )
-    return points, labels
+    df["color"] = df["mark"].apply(color)
+    df["radius"] = 10
+
+    return [
+        pdk.Layer(
+            "ScatterplotLayer",
+            df,
+            get_position="[lon, lat]",
+            get_radius="radius",
+            get_fill_color="color",
+            pickable=True,
+        ),
+        pdk.Layer(
+            "TextLayer",
+            df,
+            get_position="[lon, lat]",
+            get_text="mark",
+            get_size=12,
+            get_color=[20, 20, 20, 230],
+            get_pixel_offset=[0, -12],
+        ),
+    ]
 
 
-def build_vector_layers(boats_df: pd.DataFrame) -> tuple[pdk.Layer, pdk.Layer, pdk.Layer]:
-    df = boats_df.dropna(subset=["lat", "lon"]).copy()
-    df["color"] = df["boat"].astype(str).apply(color_for_boat)
+def _make_dashed_segments(p1, p2, n_segments=22):
+    x1, y1 = p1
+    x2, y2 = p2
+    segs = []
+    for i in range(n_segments):
+        if i % 2 == 0:
+            a = i / n_segments
+            b = (i + 1) / n_segments
+            segs.append(
+                [
+                    [x1 + (x2 - x1) * a, y1 + (y2 - y1) * a],
+                    [x1 + (x2 - x1) * b, y1 + (y2 - y1) * b],
+                ]
+            )
+    return segs
 
-    df["heading_deg"] = pd.to_numeric(df.get("COG_deg"), errors="coerce")
-    v = pd.to_numeric(df.get("BSP_kmph"), errors="coerce")
-    df["arrow_m"] = (60.0 + 3.0 * v.fillna(0.0)).clip(lower=60.0, upper=260.0)
 
-    is_avg = df["boat"].astype(str) == "AVG_fleet"
-    if "AVG_VEC_BEARING_deg" in df.columns:
-        df.loc[is_avg, "heading_deg"] = pd.to_numeric(df.loc[is_avg, "AVG_VEC_BEARING_deg"], errors="coerce")
-    if "AVG_VEC_DIST_m" in df.columns:
-        dist = pd.to_numeric(df.loc[is_avg, "AVG_VEC_DIST_m"], errors="coerce")
-        df.loc[is_avg, "arrow_m"] = (dist * 2.5).clip(lower=20.0, upper=260.0)
+def build_startline_layer_dashed(marks_df: pd.DataFrame):
+    sl1 = marks_df.loc[marks_df["mark"] == "SL1"]
+    sl2 = marks_df.loc[marks_df["mark"] == "SL2"]
+    if sl1.empty or sl2.empty:
+        return None
 
-    ends = df.apply(
-        lambda r: offset_latlon(float(r["lat"]), float(r["lon"]), float(r["heading_deg"]), float(r["arrow_m"]))
-        if np.isfinite(r.get("heading_deg", np.nan)) and np.isfinite(r.get("arrow_m", np.nan)) else (np.nan, np.nan),
-        axis=1,
-        result_type="expand",
-    )
-    df["lat2"] = ends[0]
-    df["lon2"] = ends[1]
-    df["path"] = df.apply(lambda r: [[r["lon"], r["lat"]], [r["lon2"], r["lat2"]]], axis=1)
+    p1 = [float(sl1.iloc[0]["lon"]), float(sl1.iloc[0]["lat"])]
+    p2 = [float(sl2.iloc[0]["lon"]), float(sl2.iloc[0]["lat"])]
 
-    # Cercles bateaux réduits (~ -30%)
-    base_layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=df,
-        get_position='[lon, lat]',
-        get_radius=7,
-        get_fill_color="color",
-        pickable=True,
-    )
+    segs = _make_dashed_segments(p1, p2, n_segments=26)
+    df = pd.DataFrame([{"path": s} for s in segs])
 
-    path_layer = pdk.Layer(
+    return pdk.Layer(
         "PathLayer",
-        data=df.dropna(subset=["lat2", "lon2"]),
+        df,
         get_path="path",
         get_width=2,
-        get_color="color",
-        pickable=False,
+        width_min_pixels=2,
+        get_color=[80, 80, 80, 210],
     )
 
-    head = df.dropna(subset=["lat2", "lon2", "heading_deg"]).copy()
-    head["glyph"] = "➤"
-    head_layer = pdk.Layer(
-        "TextLayer",
-        data=head,
-        get_position='[lon2, lat2]',
-        get_text="glyph",
-        get_size=20,
-        get_angle="heading_deg",
-        get_color="color",
-        get_alignment_baseline="'center'",
-        get_text_anchor="'middle'",
-        pickable=False,
-    )
-    return base_layer, path_layer, head_layer
+
+def _meters_per_deg(lat_deg: float) -> tuple[float, float]:
+    m_per_deg_lat = 111_320.0
+    m_per_deg_lon = 111_320.0 * float(np.cos(np.deg2rad(lat_deg)))
+    return m_per_deg_lat, m_per_deg_lon
 
 
-def build_boat_label_layer_name_ttk_only(boats_df: pd.DataFrame) -> pdk.Layer:
+def build_boats_layers(boats_df: pd.DataFrame):
     df = boats_df.dropna(subset=["lat", "lon"]).copy()
-
-    def _fmt(r):
-        boat = str(r.get("boat", ""))
-        ttk = r.get("TTK_s", np.nan)
-        if np.isfinite(ttk):
-            return f"{boat}/{ttk:.0f}s"
-        return boat
-
-    df["label"] = df.apply(_fmt, axis=1)
-
-    return pdk.Layer(
-        "TextLayer",
-        data=df,
-        get_position='[lon, lat]',
-        get_text="label",
-        get_size=12,
-        get_alignment_baseline="'top'",
-        get_text_anchor="'middle'",
-        get_color=[20, 20, 20],
-        pickable=False,
-    )
-
-
-def build_cross_layer(cross_df: pd.DataFrame) -> pdk.Layer:
-    df = cross_df.dropna(subset=["lat", "lon"]).copy()
     if df.empty:
-        return pdk.Layer("ScatterplotLayer", data=pd.DataFrame({"lat": [], "lon": []}), get_position='[lon, lat]')
+        return []
 
-    if "color" not in df.columns:
-        df["color"] = df["boat"].astype(str).apply(color_for_boat)
-
-    return pdk.Layer(
+    base = pdk.Layer(
         "ScatterplotLayer",
-        data=df,
-        get_position='[lon, lat]',
-        get_radius=6,
+        df,
+        get_position="[lon, lat]",
+        get_radius=4,
         get_fill_color="color",
-        get_line_color=[0, 0, 0],
+        get_line_color=[0, 0, 0, 60],
         line_width_min_pixels=1,
         pickable=True,
     )
 
+    vec = df.copy()
+    if "VEC_BEARING_deg" in vec.columns and "VEC_DIST_m" in vec.columns:
+        vec["heading"] = pd.to_numeric(vec["VEC_BEARING_deg"], errors="coerce")
+        vec["dist_m"] = pd.to_numeric(vec["VEC_DIST_m"], errors="coerce")
+    else:
+        vec["heading"] = pd.to_numeric(vec.get("COG_deg"), errors="coerce")
+        bsp = pd.to_numeric(vec.get("BSP_kmph"), errors="coerce")
+        vec["dist_m"] = (bsp / 3.6).clip(lower=0.0)
 
-def build_cross_label_layer(cross_df: pd.DataFrame) -> pdk.Layer:
-    df = cross_df.dropna(subset=["lat", "lon"]).copy()
-    if df.empty or "label" not in df.columns:
-        return pdk.Layer("TextLayer", data=pd.DataFrame({"lat": [], "lon": [], "label": []}), get_position='[lon, lat]')
+    vec = vec.dropna(subset=["heading", "dist_m", "lat", "lon"]).copy()
 
-    if "color" not in df.columns:
-        df["color"] = df["boat"].astype(str).apply(color_for_boat)
+    vector_layer = None
+    if not vec.empty:
+        m_per_deg_lat, _ = _meters_per_deg(float(vec["lat"].astype(float).mean()))
+        m_per_deg_lon = 111_320.0 * np.cos(np.deg2rad(vec["lat"].astype(float)))
 
-    return pdk.Layer(
+        theta = np.deg2rad(vec["heading"].astype(float))
+        dx = vec["dist_m"].astype(float) * np.sin(theta)
+        dy = vec["dist_m"].astype(float) * np.cos(theta)
+
+        vec["lon2"] = vec["lon"].astype(float) + dx / m_per_deg_lon
+        vec["lat2"] = vec["lat"].astype(float) + dy / m_per_deg_lat
+
+        vec["path"] = vec.apply(
+            lambda r: [[float(r["lon"]), float(r["lat"])], [float(r["lon2"]), float(r["lat2"])]],
+            axis=1,
+        )
+
+        vector_layer = pdk.Layer(
+            "PathLayer",
+            vec,
+            get_path="path",
+            get_width=2,
+            width_min_pixels=2,
+            get_color="color",
+        )
+
+    def _label(r):
+        ttk = r.get("TTK_s")
+        if pd.notna(ttk):
+            return f"{r['boat']} / {int(ttk)}s"
+        return str(r["boat"])
+
+    df["label"] = df.apply(_label, axis=1)
+
+    labels = pdk.Layer(
         "TextLayer",
-        data=df,
-        get_position='[lon, lat]',
+        df,
+        get_position="[lon, lat]",
         get_text="label",
         get_size=11,
         get_color="color",
-        get_alignment_baseline="'top'",
-        get_text_anchor="'middle'",
-        get_pixel_offset=[0, 16],
-        pickable=False,
+        get_pixel_offset=[0, 10],
     )
 
+    layers = [base, labels]
+    if vector_layer is not None:
+        layers.insert(1, vector_layer)
 
-def build_trace_layer(trace_df: pd.DataFrame) -> pdk.Layer:
-    df = trace_df.dropna(subset=["path"]).copy()
-    if df.empty:
-        return pdk.Layer("PathLayer", data=pd.DataFrame({"path": []}), get_path="path")
+    return layers
 
-    if "color" not in df.columns:
-        df["color"] = df["boat"].astype(str).apply(color_for_boat)
 
+def build_trace_layer(trace_df: pd.DataFrame):
+    if trace_df is None or trace_df.empty:
+        return None
     return pdk.Layer(
         "PathLayer",
-        data=df,
+        trace_df,
         get_path="path",
-        get_width=1,
-        width_min_pixels=1,
         get_color="color",
-        pickable=False,
-    )
-
-
-def build_boundary_outline_layers(boundary_df: pd.DataFrame) -> list[pdk.Layer]:
-    """
-    Contour violet uniquement, multi-rings via colonne 'ring'.
-    boundary_df: colonnes ring, lat, lon (degrees)
-    """
-    if boundary_df is None or boundary_df.empty:
-        return []
-
-    df = boundary_df.dropna(subset=["lat", "lon"]).copy()
-
-    # si pas de colonne ring, on considère ring unique
-    if "ring" not in df.columns:
-        df["ring"] = 0
-
-    data = []
-    for ring_id, g in df.groupby("ring", sort=True):
-        g2 = g.copy()
-        # garder l'ordre d'origine autant que possible; si seq existe, trier
-        if "seq" in g2.columns:
-            g2 = g2.sort_values("seq")
-
-        path = g2[["lon", "lat"]].astype(float).values.tolist()
-        if len(path) < 2:
-            continue
-        if path[0] != path[-1]:
-            path = path + [path[0]]
-
-        data.append({"ring": int(ring_id), "path": path})
-
-    if not data:
-        return []
-
-    layer = pdk.Layer(
-        "PathLayer",
-        data=data,
-        get_path="path",
-        get_color=[138, 43, 226, 230],
         get_width=2,
         width_min_pixels=2,
-        pickable=False,
     )
-    return [layer]
+
+
+def build_cross_layers(cross_df: pd.DataFrame):
+    if cross_df is None or cross_df.empty:
+        return []
+    points = pdk.Layer(
+        "ScatterplotLayer",
+        cross_df,
+        get_position="[lon, lat]",
+        get_radius=7,
+        get_fill_color="color",
+        pickable=True,
+    )
+    labels = pdk.Layer(
+        "TextLayer",
+        cross_df,
+        get_position="[lon, lat]",
+        get_text="label",
+        get_size=11,
+        get_color="color",
+        get_pixel_offset=[0, 14],
+    )
+    return [points, labels]
+
+
+def build_boundary_layer(boundary_df: pd.DataFrame | None):
+    """
+    Dessine la boundary (CourseLimit) si présente.
+    On utilise un PathLayer fermé (simple et robuste).
+    Attendu: colonnes lat/lon (seq optionnel).
+    """
+    if boundary_df is None or boundary_df.empty:
+        return None
+
+    df = boundary_df.dropna(subset=["lat", "lon"]).copy()
+    if df.empty:
+        return None
+
+    if "seq" in df.columns:
+        df = df.sort_values("seq")
+
+    path = df[["lon", "lat"]].astype(float).values.tolist()
+    if len(path) < 3:
+        return None
+
+    # fermer le polygone visuellement
+    if path[0] != path[-1]:
+        path = path + [path[0]]
+
+    bdf = pd.DataFrame([{"path": path}])
+    return pdk.Layer(
+        "PathLayer",
+        bdf,
+        get_path="path",
+        get_width=2,
+        width_min_pixels=2,
+        get_color=[40, 40, 40, 180],
+    )
 
 
 def build_deck(
@@ -290,56 +265,42 @@ def build_deck(
     boundary_df: pd.DataFrame | None = None,
 ) -> pdk.Deck:
 
-    pts = pd.concat(
-        [boats_df[["lat", "lon"]].copy(), marks_df[["lat", "lon"]].copy()],
-        ignore_index=True,
-    ).dropna()
+    lat_center = _safe_mean(pd.concat([boats_df["lat"], marks_df["lat"]], ignore_index=True))
+    lon_center = _safe_mean(pd.concat([boats_df["lon"], marks_df["lon"]], ignore_index=True))
 
-    if cross_df is not None and not cross_df.empty:
-        pts = pd.concat([pts, cross_df[["lat", "lon"]].copy()], ignore_index=True).dropna()
+    layers = []
 
-    if boundary_df is not None and not boundary_df.empty:
-        bpts = boundary_df[["lat", "lon"]].copy()
-        pts = pd.concat([pts, bpts], ignore_index=True).dropna()
+    # Boundary en fond (carto du haut)
+    b_layer = build_boundary_layer(boundary_df)
+    if b_layer is not None:
+        layers.append(b_layer)
 
-    if pts.empty:
-        center_lat, center_lon = 0.0, 0.0
-    else:
-        center_lat, center_lon = float(pts["lat"].mean()), float(pts["lon"].mean())
+    sl_layer = build_startline_layer_dashed(marks_df)
+    if sl_layer is not None:
+        layers.append(sl_layer)
 
-    bearing_map = compute_map_bearing_to_align_sl1_sl2(marks_df)
+    trace = build_trace_layer(trace_df)
+    if trace is not None:
+        layers.append(trace)
 
-    buoy_points, buoy_labels = build_buoy_layers(marks_df)
-    base_layer, path_layer, head_layer = build_vector_layers(boats_df)
-    boat_labels = build_boat_label_layer_name_ttk_only(boats_df)
+    layers += build_marks_layers(marks_df)
+    layers += build_boats_layers(boats_df)
+    layers += build_cross_layers(cross_df)
 
-    layers: list[pdk.Layer] = []
-
-    if trace_df is not None and not trace_df.empty:
-        layers.append(build_trace_layer(trace_df))
-
-    if boundary_df is not None and not boundary_df.empty:
-        layers += build_boundary_outline_layers(boundary_df)
-
-    layers += [path_layer, head_layer, base_layer, boat_labels, buoy_points, buoy_labels]
-
-    if cross_df is not None and not cross_df.empty:
-        layers.insert(0, build_cross_label_layer(cross_df))
-        layers.insert(0, build_cross_layer(cross_df))
+    bearing = bearing_sl1_sl2(marks_df)
 
     view_state = pdk.ViewState(
-        latitude=center_lat,
-        longitude=center_lon,
+        latitude=lat_center,
+        longitude=lon_center,
         zoom=13,
-        bearing=bearing_map,
+        bearing=bearing,
         pitch=0,
     )
-
-    tooltip = {"text": "{boat}\nTTK {TTK_s}s\nCOG {COG_deg}°"}
 
     return pdk.Deck(
         layers=layers,
         initial_view_state=view_state,
-        tooltip=tooltip,
-        map_style=CARTO_POSITRON,
+        map_style=CARTO_STYLE,
+        tooltip={"text": "{boat}"},
     )
+

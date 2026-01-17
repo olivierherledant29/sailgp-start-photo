@@ -22,7 +22,8 @@ DEFAULT_INFLUX_ORG = "0c2a130d50b8facc"
 DEFAULT_INFLUX_BUCKET = "sailgp"
 TOKEN_ENV = "SailGP_TOKEN"
 
-GPS_SCALE = 1e7  # degrees * 1e7
+GPS_SCALE = 1e7  # degrés * 1e7 (SailGP)
+
 
 ALL_BOATS = ["AUS", "BRA", "CAN", "DEN", "ESP", "FRA", "GBR", "GER", "ITA", "NZL", "SUI", "USA", "SWE"]
 MARKS = ["SL1", "SL2", "M1"]
@@ -33,7 +34,7 @@ BOAT_CHANNELS = [
     "BOAT_SPEED_km_h_1",
     "TWA_MHU_SGP_deg",
     "TWD_MHU_SGP_deg",
-    "TWS_MHU_SGP_km_h_1",   # <-- AJOUT
+    "TWS_MHU_SGP_km_h_1",
     "GPS_COG_deg",
     "PC_TTS_s",
     "PC_TTK_s",
@@ -63,7 +64,7 @@ def get_cfg() -> InfluxCfg:
 
 
 def get_client(cfg: InfluxCfg) -> InfluxDBClient:
-    # verify_ssl=False pour éviter l’InsecureRequestWarning en local
+    # verify_ssl=False pour éviter les warnings en local
     return InfluxDBClient(url=cfg.url, token=cfg.token, org=cfg.org, verify_ssl=False)
 
 
@@ -75,22 +76,25 @@ def iso_z(dt: datetime) -> str:
 
 
 def snapshot_window_times(start_gun_utc: datetime, offset_s: int, half_window_s: int) -> tuple[datetime, datetime]:
+    """
+    IMPORTANT: Influx refuse range(start=..., stop=...) si start==stop.
+    On force une fenêtre minimale de 1 seconde.
+    """
     if start_gun_utc.tzinfo is None:
         start_gun_utc = start_gun_utc.replace(tzinfo=timezone.utc)
+
+    hw = max(1, int(half_window_s))
     center = start_gun_utc + timedelta(seconds=int(offset_s))
-    t0 = center - timedelta(seconds=int(half_window_s))
-    t1 = center + timedelta(seconds=int(half_window_s))
+    t0 = center - timedelta(seconds=hw)
+    t1 = center + timedelta(seconds=hw)
     return t0, t1
 
 
 def scale_latlon_always(df: pd.DataFrame, lat_col="lat", lon_col="lon") -> pd.DataFrame:
     """
-    IMPORTANT:
-    - GPS_unk (bateaux) est typiquement en degrés * 1e7
-    - MDSS_deg (marques) est déjà en degrés
-
-    Donc on applique une heuristique :
-      si |val| > 180 => on divise par 1e7, sinon on laisse tel quel.
+    - GPS_unk (bateaux) parfois en degrés * 1e7
+    - MDSS_deg (marques) déjà en degrés
+    Heuristique: si |val| > 180 => /1e7
     """
     out = df.copy()
 
@@ -110,10 +114,6 @@ def scale_latlon_always(df: pd.DataFrame, lat_col="lat", lon_col="lon") -> pd.Da
 
     return out
 
-
-# -----------------------
-# Generic queries
-# -----------------------
 
 def query_mean_by_boat(
     cfg: InfluxCfg,
@@ -183,12 +183,8 @@ from(bucket: "{cfg.bucket}")
     return out.dropna(subset=["boat"]).reset_index(drop=True)
 
 
-# -----------------------
-# Public loaders
-# -----------------------
-
 @st.cache_data(show_spinner=False, ttl=300)
-def load_boat_snapshot(cfg: InfluxCfg, start_gun_utc: datetime, offset_s: int, half_window_s: int = 5) -> pd.DataFrame:
+def load_boat_snapshot(cfg: InfluxCfg, start_gun_utc: datetime, offset_s: int, half_window_s: int = 1) -> pd.DataFrame:
     t0, t1 = snapshot_window_times(start_gun_utc, offset_s, half_window_s)
     base = pd.DataFrame({"boat": ALL_BOATS})
 
@@ -199,10 +195,7 @@ def load_boat_snapshot(cfg: InfluxCfg, start_gun_utc: datetime, offset_s: int, h
     base["BSP_kmph"] = pd.to_numeric(base.get("BOAT_SPEED_km_h_1"), errors="coerce")
     base["TWA_deg"] = pd.to_numeric(base.get("TWA_MHU_SGP_deg"), errors="coerce")
     base["TWD_deg"] = pd.to_numeric(base.get("TWD_MHU_SGP_deg"), errors="coerce")
-
-    # Ajouts demandés (lecture FRA — mais dispo si feed pour autres)
     base["TWS_kmph"] = pd.to_numeric(base.get("TWS_MHU_SGP_km_h_1"), errors="coerce")
-    base["TWD_MHU_deg"] = base["TWD_deg"]
 
     base["COG_deg"] = pd.to_numeric(base.get("GPS_COG_deg"), errors="coerce")
     base["TTK_s"] = pd.to_numeric(base.get("PC_TTK_s"), errors="coerce")
@@ -215,7 +208,7 @@ def load_boat_snapshot(cfg: InfluxCfg, start_gun_utc: datetime, offset_s: int, h
 
 
 @st.cache_data(show_spinner=False, ttl=300)
-def load_marks_snapshot(cfg: InfluxCfg, start_gun_utc: datetime, offset_s: int, half_window_s: int = 5) -> pd.DataFrame:
+def load_marks_snapshot(cfg: InfluxCfg, start_gun_utc: datetime, offset_s: int, half_window_s: int = 2) -> pd.DataFrame:
     t0, t1 = snapshot_window_times(start_gun_utc, offset_s, half_window_s)
 
     df_lat = query_mean_by_boat(cfg, MARK_LAT_CH, MARKS, t0, t1, "mdss|mdss_fast|strm|raw").rename(columns={"value": "lat"})
@@ -227,67 +220,77 @@ def load_marks_snapshot(cfg: InfluxCfg, start_gun_utc: datetime, offset_s: int, 
     return out
 
 
+@st.cache_data(show_spinner=False, ttl=60)
+def load_latlon_timeseries_1s(cfg: InfluxCfg, boats: list[str], start_utc: datetime, stop_utc: datetime) -> pd.DataFrame:
+    boats_or = " or ".join([f'r["boat"] == "{b}"' for b in boats])
+    flux = f'''
+from(bucket: "{cfg.bucket}")
+  |> range(start: {iso_z(start_utc)}, stop: {iso_z(stop_utc)})
+  |> filter(fn: (r) => r["_field"] == "value")
+  |> filter(fn: (r) => (r["_measurement"] == "LATITUDE_GPS_unk" or r["_measurement"] == "LONGITUDE_GPS_unk"))
+  |> filter(fn: (r) => r["level"] =~ /strm|mdss|mdss_fast|raw/)
+  |> filter(fn: (r) => {boats_or})
+  |> aggregateWindow(every: 1s, fn: last, createEmpty: false)
+  |> pivot(rowKey:["_time","boat"], columnKey:["_measurement"], valueColumn:"_value")
+  |> keep(columns: ["_time","boat","LATITUDE_GPS_unk","LONGITUDE_GPS_unk"])
+  |> rename(columns: {{_time:"time_utc", LATITUDE_GPS_unk:"lat_raw", LONGITUDE_GPS_unk:"lon_raw"}})
+'''
+    client = get_client(cfg)
+    df = client.query_api().query_data_frame(org=cfg.org, query=flux)
+
+    if isinstance(df, list):
+        df = pd.concat(df, ignore_index=True) if df else pd.DataFrame(columns=["time_utc", "boat", "lat_raw", "lon_raw"])
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["time_utc", "boat", "lat_raw", "lon_raw"])
+
+    df["time_utc"] = pd.to_datetime(df["time_utc"], utc=True)
+    return df.sort_values(["boat", "time_utc"]).reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def load_trace_boat(cfg: InfluxCfg, boat: str, start_utc: datetime, stop_utc: datetime) -> pd.DataFrame:
+    df = load_latlon_timeseries_1s(cfg, [boat], start_utc, stop_utc)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["time_utc", "boat", "lat", "lon"])
+
+    out = df.copy()
+    out["lat"] = pd.to_numeric(out.get("lat_raw"), errors="coerce")
+    out["lon"] = pd.to_numeric(out.get("lon_raw"), errors="coerce")
+
+    if out["lat"].notna().any() and float(np.nanmax(np.abs(out["lat"].to_numpy()))) > 180.0:
+        out["lat"] = out["lat"] / GPS_SCALE
+    if out["lon"].notna().any() and float(np.nanmax(np.abs(out["lon"].to_numpy()))) > 180.0:
+        out["lon"] = out["lon"] / GPS_SCALE
+
+    out = out.dropna(subset=["time_utc", "lat", "lon"])
+    return out[["time_utc", "boat", "lat", "lon"]].reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def load_twd_tws_fra(cfg: InfluxCfg, start_gun_utc: datetime, offset_s: int, half_window_s: int = 2) -> dict:
+    df = load_boat_snapshot(cfg, start_gun_utc, offset_s, half_window_s=half_window_s)
+    if df is None or df.empty:
+        return {}
+
+    fra = df[df["boat"].astype(str) == "FRA"]
+    if fra.empty:
+        return {}
+
+    r = fra.iloc[0]
+    twd = pd.to_numeric(r.get("TWD_MHU_SGP_deg"), errors="coerce")
+    tws = pd.to_numeric(r.get("TWS_MHU_SGP_km_h_1"), errors="coerce")
+
+    out = {}
+    if pd.notna(twd):
+        out["TWD_MHU_SGP_deg"] = float(twd)
+    if pd.notna(tws):
+        out["TWS_MHU_SGP_km_h_1"] = float(tws)
+    return out
+
+
 # -----------------------
-# AVG_fleet vector: mean displacement (hors FRA)
+# Start detection (RACE_START_COUNT FRA)
 # -----------------------
-
-@st.cache_data(show_spinner=False, ttl=300)
-def load_avg_fleet_vector_mean_displacement(
-    cfg: InfluxCfg,
-    start_gun_utc: datetime,
-    offset_s: int,
-    half_window_s: int = 5,
-    endpoint_half_window_s: int = 1,
-    included_boats: list[str] | None = None,
-) -> dict[str, float]:
-    boats_src = included_boats if included_boats is not None else ALL_BOATS
-    boats = [b for b in boats_src if b != "FRA"]
-    if not boats:
-        return {"bearing_deg": float("nan"), "distance_m": float("nan")}
-
-    t0, t1 = snapshot_window_times(start_gun_utc, offset_s, half_window_s)
-
-    ehw = timedelta(seconds=int(endpoint_half_window_s))
-    t0a, t0b = t0 - ehw, t0 + ehw
-    t1a, t1b = t1 - ehw, t1 + ehw
-
-    lat0 = query_last_by_boat(cfg, "LATITUDE_GPS_unk", boats, t0a, t0b, "strm").rename(columns={"value": "lat0"})
-    lon0 = query_last_by_boat(cfg, "LONGITUDE_GPS_unk", boats, t0a, t0b, "strm").rename(columns={"value": "lon0"})
-    lat1 = query_last_by_boat(cfg, "LATITUDE_GPS_unk", boats, t1a, t1b, "strm").rename(columns={"value": "lat1"})
-    lon1 = query_last_by_boat(cfg, "LONGITUDE_GPS_unk", boats, t1a, t1b, "strm").rename(columns={"value": "lon1"})
-
-    df = lat0.merge(lon0, on="boat", how="inner").merge(lat1.merge(lon1, on="boat", how="inner"), on="boat", how="inner")
-    if df.empty:
-        return {"bearing_deg": float("nan"), "distance_m": float("nan")}
-
-    for c in ("lat0", "lon0", "lat1", "lon1"):
-        df[c] = pd.to_numeric(df[c], errors="coerce") / GPS_SCALE
-    df = df.dropna(subset=["lat0", "lon0", "lat1", "lon1"])
-    if df.empty:
-        return {"bearing_deg": float("nan"), "distance_m": float("nan")}
-
-    lat_ref = float(df[["lat0", "lat1"]].stack().mean())
-    m_per_deg_lat = 111_320.0
-    m_per_deg_lon = 111_320.0 * float(np.cos(np.deg2rad(lat_ref)))
-
-    dx = (df["lon1"] - df["lon0"]) * m_per_deg_lon
-    dy = (df["lat1"] - df["lat0"]) * m_per_deg_lat
-
-    dxm = float(np.nanmean(dx))
-    dym = float(np.nanmean(dy))
-    dist_mean = float(np.nanmean(np.sqrt(dx * dx + dy * dy)))
-
-    if not np.isfinite([dxm, dym, dist_mean]).all():
-        return {"bearing_deg": float("nan"), "distance_m": float("nan")}
-
-    bearing = float((np.degrees(np.arctan2(dxm, dym)) + 360.0) % 360.0)
-    return {"bearing_deg": bearing, "distance_m": dist_mean}
-
-
-# -----------------------
-# Start detection support (RACE_START_COUNT FRA)
-# -----------------------
-
 @st.cache_data(show_spinner=False, ttl=300)
 def load_race_start_count_day_fra(cfg: InfluxCfg, day_utc: date) -> pd.DataFrame:
     start_utc = datetime.combine(day_utc, time(0, 0, 0), tzinfo=timezone.utc)
@@ -336,57 +339,3 @@ def detect_starts_from_race_start_count(df_count: pd.DataFrame) -> pd.DataFrame:
     hits = hits[["detected_time_utc", "count_before", "count_after"]].reset_index(drop=True)
     hits["start_index"] = np.arange(1, len(hits) + 1, dtype=int)
     return hits[["start_index", "detected_time_utc", "count_before", "count_after"]]
-
-
-# -----------------------
-# Timeseries lat/lon (1 Hz) pour crossing
-# -----------------------
-
-@st.cache_data(show_spinner=False, ttl=300)
-def load_latlon_timeseries_1s(cfg: InfluxCfg, boats: list[str], start_utc: datetime, stop_utc: datetime) -> pd.DataFrame:
-    boats_or = " or ".join([f'r["boat"] == "{b}"' for b in boats])
-    flux = f'''
-from(bucket: "{cfg.bucket}")
-  |> range(start: {iso_z(start_utc)}, stop: {iso_z(stop_utc)})
-  |> filter(fn: (r) => r["_field"] == "value")
-  |> filter(fn: (r) => (r["_measurement"] == "LATITUDE_GPS_unk" or r["_measurement"] == "LONGITUDE_GPS_unk"))
-  |> filter(fn: (r) => r["level"] =~ /strm|mdss|mdss_fast|raw/)
-  |> filter(fn: (r) => {boats_or})
-  |> aggregateWindow(every: 1s, fn: last, createEmpty: false)
-  |> pivot(rowKey:["_time","boat"], columnKey:["_measurement"], valueColumn:"_value")
-  |> keep(columns: ["_time","boat","LATITUDE_GPS_unk","LONGITUDE_GPS_unk"])
-  |> rename(columns: {{_time:"time_utc", LATITUDE_GPS_unk:"lat_raw", LONGITUDE_GPS_unk:"lon_raw"}})
-'''
-    client = get_client(cfg)
-    df = client.query_api().query_data_frame(org=cfg.org, query=flux)
-
-    if isinstance(df, list):
-        df = pd.concat(df, ignore_index=True) if df else pd.DataFrame(columns=["time_utc", "boat", "lat_raw", "lon_raw"])
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["time_utc", "boat", "lat_raw", "lon_raw"])
-
-    df["time_utc"] = pd.to_datetime(df["time_utc"], utc=True)
-    return df.sort_values(["boat", "time_utc"]).reset_index(drop=True)
-
-
-@st.cache_data(show_spinner=False, ttl=1)
-def load_fra_tts_ttk_at_time(cfg: InfluxCfg, t_utc: datetime) -> dict[str, float]:
-    """
-    Retourne TTS_s et TTK_s (mean 1s) autour de t_utc pour FRA.
-    """
-    if t_utc.tzinfo is None:
-        t_utc = t_utc.replace(tzinfo=timezone.utc)
-
-    start_dt = t_utc - timedelta(seconds=1)
-    stop_dt = t_utc + timedelta(seconds=1)
-
-    def _get(meas: str) -> float:
-        df = query_mean_by_boat(cfg, meas, ["FRA"], start_dt, stop_dt, "strm|mdss|mdss_fast|raw")
-        if df.empty:
-            return float("nan")
-        return float(df["value"].iloc[0])
-
-    return {
-        "TTS_s": _get("PC_TTS_s"),
-        "TTK_s": _get("PC_TTK_s"),
-    }
