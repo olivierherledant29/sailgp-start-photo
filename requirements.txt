@@ -5,3 +5,5 @@ pydeck
 influxdb-client
 python-dotenv
 streamlit-autorefresh
+shapely
+
