@@ -43,6 +43,19 @@ def render_start_aid(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
         unsafe_allow_html=True,
     )
 
+    # ----------------------------
+    # NOUVEAU : buffer boundary
+    # ----------------------------
+    st.subheader("Boundary")
+    boundary_buffer_m = st.number_input(
+        "Buffer boundary (m)",
+        min_value=0.0,
+        max_value=200.0,
+        value=15.0,
+        step=1.0,
+        help="Distance de sécurité autour de la boundary",
+    )
+
     PI_m = st.number_input("PI (m)", min_value=-500.0, max_value=500.0, value=60.0, step=1.0)
     TWD = st.number_input("TWD (°)", min_value=0.0, max_value=360.0, value=0.0, step=1.0)
 
@@ -74,7 +87,14 @@ def render_start_aid(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
         return None, None
 
     ctx = make_context_from_boundary(boundary_latlon)
-    geom = to_xy_marks_and_polys(ctx, marks_ll, boundary_latlon, 15.0)
+
+    # ⬇️ buffer dynamique ici
+    geom = to_xy_marks_and_polys(
+        ctx,
+        marks_ll,
+        boundary_latlon,
+        boundary_buffer_m,
+    )
 
     PI_xy = compute_PI_xy(geom["SL1_xy"], geom["SL2_xy"], PI_m)
 
