@@ -7,6 +7,44 @@ import pydeck as pdk
 
 CARTO_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
 
+try:
+    from shapely.geometry import Polygon, LineString
+except Exception:
+    Polygon = None
+    LineString = None
+
+
+def build_boundary_buffer_layer(boundary_buffer_df: pd.DataFrame | None):
+    """
+    (Conservée) Dessine un buffer boundary "plein" si on te le demande ailleurs.
+    Ici on garde ton code tel quel.
+    """
+    if boundary_buffer_df is None or boundary_buffer_df.empty:
+        return None
+
+    df = boundary_buffer_df.dropna(subset=["lat", "lon"]).copy()
+    if df.empty:
+        return None
+
+    if "seq" in df.columns:
+        df = df.sort_values("seq")
+
+    path = df[["lon", "lat"]].astype(float).values.tolist()
+    if len(path) < 3:
+        return None
+    if path[0] != path[-1]:
+        path = path + [path[0]]
+
+    bdf = pd.DataFrame([{"path": path}])
+    return pdk.Layer(
+        "PathLayer",
+        bdf,
+        get_path="path",
+        get_width=2,
+        width_min_pixels=2,
+        get_color=[40, 40, 40, 180],
+    )
+
 
 def _safe_mean(series: pd.Series, default=0.0) -> float:
     v = pd.to_numeric(series, errors="coerce")
@@ -64,6 +102,10 @@ def build_marks_layers(marks_df: pd.DataFrame):
 
 
 def _make_dashed_segments(p1, p2, n_segments=22):
+    """
+    Fabrique une alternance de segments (un segment sur deux) entre 2 points.
+    p1/p2 sont [lon,lat] (ou n'importe quel plan), on garde ta logique.
+    """
     x1, y1 = p1
     x2, y2 = p2
     segs = []
@@ -162,9 +204,9 @@ def build_boats_layers(boats_df: pd.DataFrame):
         )
 
     def _label(r):
-        ttk = r.get("TTK_s")
-        if pd.notna(ttk):
-            return f"{r['boat']} / {int(ttk)}s"
+        ttk = pd.to_numeric(r.get("TTK_s"), errors="coerce")
+        if np.isfinite(ttk):
+            return f"{r['boat']} / {int(round(float(ttk)))} TTK"
         return str(r["boat"])
 
     df["label"] = df.apply(_label, axis=1)
@@ -223,11 +265,6 @@ def build_cross_layers(cross_df: pd.DataFrame):
 
 
 def build_boundary_layer(boundary_df: pd.DataFrame | None):
-    """
-    Dessine la boundary (CourseLimit) si présente.
-    On utilise un PathLayer fermé (simple et robuste).
-    Attendu: colonnes lat/lon (seq optionnel).
-    """
     if boundary_df is None or boundary_df.empty:
         return None
 
@@ -242,7 +279,6 @@ def build_boundary_layer(boundary_df: pd.DataFrame | None):
     if len(path) < 3:
         return None
 
-    # fermer le polygone visuellement
     if path[0] != path[-1]:
         path = path + [path[0]]
 
@@ -257,12 +293,126 @@ def build_boundary_layer(boundary_df: pd.DataFrame | None):
     )
 
 
+def _build_boundary_buffer_dashed_layer(boundary_df: pd.DataFrame | None, buffer_m: float | None):
+    """
+    (Conservée) Buffer intérieur (négatif) tracé en pointillé.
+    Nécessite shapely; sinon, on skip sans casser l’app.
+    """
+    if buffer_m is None:
+        return None
+    try:
+        buffer_m = float(buffer_m)
+    except Exception:
+        return None
+    if not np.isfinite(buffer_m) or buffer_m <= 0:
+        return None
+    if boundary_df is None or boundary_df.empty:
+        return None
+    if Polygon is None:
+        return None
+
+    df = boundary_df.dropna(subset=["lat", "lon"]).copy()
+    if df.empty:
+        return None
+    if "seq" in df.columns:
+        df = df.sort_values("seq")
+
+    lat0 = float(df["lat"].astype(float).mean())
+    lon0 = float(df["lon"].astype(float).mean())
+    m_per_deg_lat, m_per_deg_lon = _meters_per_deg(lat0)
+
+    xs = (df["lon"].astype(float) - lon0) * m_per_deg_lon
+    ys = (df["lat"].astype(float) - lat0) * m_per_deg_lat
+    coords_xy = list(zip(xs.to_numpy(float), ys.to_numpy(float)))
+
+    poly = Polygon(coords_xy)
+    if (not poly.is_valid) or poly.area <= 0:
+        poly = poly.buffer(0)
+    if (not poly.is_valid) or poly.area <= 0:
+        return None
+
+    poly_buf = poly.buffer(-buffer_m)
+    if poly_buf.is_empty:
+        return None
+
+    if poly_buf.geom_type == "MultiPolygon":
+        poly_buf = max(list(poly_buf.geoms), key=lambda p: p.area)
+
+    ring = list(poly_buf.exterior.coords)
+    if len(ring) < 4:
+        return None
+
+    path_ll = []
+    for x, y in ring:
+        lon = lon0 + (x / m_per_deg_lon)
+        lat = lat0 + (y / m_per_deg_lat)
+        path_ll.append([float(lon), float(lat)])
+
+    segs = []
+    for i in range(len(path_ll) - 1):
+        segs.extend(_make_dashed_segments(path_ll[i], path_ll[i + 1], n_segments=10))
+
+    if not segs:
+        return None
+
+    sdf = pd.DataFrame([{"path": s} for s in segs])
+    return pdk.Layer(
+        "PathLayer",
+        sdf,
+        get_path="path",
+        get_width=2,
+        width_min_pixels=2,
+        get_color=[40, 40, 40, 180],
+    )
+
+
+def _build_boundary_buffer_dashed_layer_from_df(boundary_buffer_df: pd.DataFrame | None):
+    """
+    NEW (robuste): dessine le buffer à partir du DF (déjà calculé côté app_start_photo3),
+    donc sans shapely et sans dépendre de boundary_buffer_m.
+    """
+    if boundary_buffer_df is None or boundary_buffer_df.empty:
+        return None
+
+    df = boundary_buffer_df.dropna(subset=["lat", "lon"]).copy()
+    if df.empty:
+        return None
+    if "seq" in df.columns:
+        df = df.sort_values("seq")
+
+    path = df[["lon", "lat"]].astype(float).values.tolist()
+    if len(path) < 3:
+        return None
+    if path[0] != path[-1]:
+        path = path + [path[0]]
+
+    segs = []
+    for i in range(len(path) - 1):
+        segs.extend(_make_dashed_segments(path[i], path[i + 1], n_segments=10))
+
+    if not segs:
+        return None
+
+    sdf = pd.DataFrame([{"path": s} for s in segs])
+    return pdk.Layer(
+        "PathLayer",
+        sdf,
+        get_path="path",
+        get_width=2,
+        width_min_pixels=2,
+        get_color=[40, 40, 40, 180],
+    )
+
+
 def build_deck(
     boats_df: pd.DataFrame,
     marks_df: pd.DataFrame,
     cross_df: pd.DataFrame | None = None,
     trace_df: pd.DataFrame | None = None,
     boundary_df: pd.DataFrame | None = None,
+    boundary_buffer_df: pd.DataFrame | None = None,  # NEW: buffer déjà calculé (préféré)
+    boundary_buffer_m: float | None = None,          # NEW: fallback shapely si pas de df
+    tts_s: float | None = None,
 ) -> pdk.Deck:
 
     lat_center = _safe_mean(pd.concat([boats_df["lat"], marks_df["lat"]], ignore_index=True))
@@ -270,10 +420,21 @@ def build_deck(
 
     layers = []
 
-    # Boundary en fond (carto du haut)
+    # Boundary en fond
     b_layer = build_boundary_layer(boundary_df)
     if b_layer is not None:
         layers.append(b_layer)
+
+    # Buffer boundary (pointillé)
+    buf_layer = None
+    if boundary_buffer_df is not None and not boundary_buffer_df.empty:
+        buf_layer = _build_boundary_buffer_dashed_layer_from_df(boundary_buffer_df)
+    else:
+        # fallback shapely (si tu passes boundary_buffer_m au lieu de boundary_buffer_df)
+        buf_layer = _build_boundary_buffer_dashed_layer(boundary_df, boundary_buffer_m)
+
+    if buf_layer is not None:
+        layers.append(buf_layer)
 
     sl_layer = build_startline_layer_dashed(marks_df)
     if sl_layer is not None:
@@ -286,6 +447,26 @@ def build_deck(
     layers += build_marks_layers(marks_df)
     layers += build_boats_layers(boats_df)
     layers += build_cross_layers(cross_df)
+
+    # TTS badge (bas-gauche)
+    if tts_s is not None and np.isfinite(tts_s):
+        tts_txt = f"{int(round(float(tts_s)))} TTS"
+        tts_df = pd.DataFrame([{
+            "lat": lat_center,
+            "lon": lon_center,
+            "text": tts_txt,
+        }])
+        tts_layer = pdk.Layer(
+            "TextLayer",
+            tts_df,
+            get_position="[lon, lat]",
+            get_text="text",
+            get_size=22,
+            get_color=[20, 20, 20, 230],
+            get_pixel_offset=[-260, 220],
+            get_alignment_baseline="'top'",
+        )
+        layers.append(tts_layer)
 
     bearing = bearing_sl1_sl2(marks_df)
 
@@ -303,4 +484,3 @@ def build_deck(
         map_style=CARTO_STYLE,
         tooltip={"text": "{boat}"},
     )
-

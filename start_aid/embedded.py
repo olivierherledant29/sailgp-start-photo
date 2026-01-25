@@ -43,18 +43,18 @@ def render_start_aid(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
         unsafe_allow_html=True,
     )
 
-    # ----------------------------
-    # NOUVEAU : buffer boundary
-    # ----------------------------
-    st.subheader("Boundary")
-    boundary_buffer_m = st.number_input(
+    # --- NEW: Buffer boundary (m) partagé via session_state
+    if "size_buffer_BDY_m" not in st.session_state:
+        st.session_state["size_buffer_BDY_m"] = 15.0
+
+    size_buffer_BDY = st.number_input(
         "Buffer boundary (m)",
         min_value=0.0,
         max_value=200.0,
-        value=15.0,
+        value=float(st.session_state["size_buffer_BDY_m"]),
         step=1.0,
-        help="Distance de sécurité autour de la boundary",
     )
+    st.session_state["size_buffer_BDY_m"] = float(size_buffer_BDY)
 
     PI_m = st.number_input("PI (m)", min_value=-500.0, max_value=500.0, value=60.0, step=1.0)
     TWD = st.number_input("TWD (°)", min_value=0.0, max_value=360.0, value=0.0, step=1.0)
@@ -88,13 +88,8 @@ def render_start_aid(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
 
     ctx = make_context_from_boundary(boundary_latlon)
 
-    # ⬇️ buffer dynamique ici
-    geom = to_xy_marks_and_polys(
-        ctx,
-        marks_ll,
-        boundary_latlon,
-        boundary_buffer_m,
-    )
+    # --- IMPORTANT: on passe size_buffer_BDY choisi dans le widget
+    geom = to_xy_marks_and_polys(ctx, marks_ll, boundary_latlon, float(size_buffer_BDY))
 
     PI_xy = compute_PI_xy(geom["SL1_xy"], geom["SL2_xy"], PI_m)
 
@@ -111,6 +106,9 @@ def render_start_aid(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
         X_percent=X_percent,
         TTS_intersection=TTS_intersection,
     )
+
+    # (optionnel, mais utile si tu veux l’exposer ailleurs)
+    out["size_buffer_BDY_m"] = float(size_buffer_BDY)
 
     deck = build_deck(ctx, geom, PI_xy, out)
     return deck, out

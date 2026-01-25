@@ -6,6 +6,9 @@ import pandas as pd
 import streamlit as st
 import time
 
+from start_aid.geo import make_context_from_boundary
+from shapely.geometry import Polygon
+from pyproj import Transformer
 
 try:
     from dotenv import load_dotenv
@@ -120,6 +123,77 @@ def last_left_to_right_crossing(
 
     return {"time_utc": pd.Timestamp(tn).tz_localize("UTC"), "lat": lat_cross, "lon": lon_cross, "dist_sl2_m": yr_cross}
 
+def _snapshot_metrics_at_time(cfg, t_utc: datetime, boat: str | None = None, eligible_codes: list[str] | None = None):
+    snap = load_boat_snapshot(cfg, t_utc, 0, half_window_s=1)
+    if snap is None or snap.empty:
+        return np.nan, np.nan
+
+    if boat is not None:
+        r = snap[snap["boat"] == boat]
+        if r.empty:
+            return np.nan, np.nan
+        bsp = pd.to_numeric(r["BSP_kmph"].iloc[0], errors="coerce")
+        ttk = pd.to_numeric(r["TTK_s"].iloc[0], errors="coerce")
+        return float(bsp) if np.isfinite(bsp) else np.nan, float(ttk) if np.isfinite(ttk) else np.nan
+
+    if eligible_codes is not None:
+        r = snap[snap["boat"].isin(eligible_codes)]
+        if r.empty:
+            return np.nan, np.nan
+        bsp = pd.to_numeric(r["BSP_kmph"], errors="coerce").mean()
+        ttk = pd.to_numeric(r["TTK_s"], errors="coerce").mean()
+        return float(bsp) if np.isfinite(bsp) else np.nan, float(ttk) if np.isfinite(ttk) else np.nan
+
+    return np.nan, np.nan
+
+
+
+def _boundary_df_to_latlon_list(boundary_df: pd.DataFrame) -> list[tuple[float, float]]:
+    if boundary_df is None or boundary_df.empty:
+        return []
+    df = boundary_df.dropna(subset=["lat", "lon"]).copy()
+    # boundary_df est déjà en degrés (chez toi)
+    return [(float(r["lat"]), float(r["lon"])) for _, r in df.iterrows()]
+
+
+def _compute_boundary_buffer_df(boundary_df: pd.DataFrame | None, buffer_m: float | None) -> pd.DataFrame | None:
+    if boundary_df is None or boundary_df.empty:
+        return None
+    if buffer_m is None or (not np.isfinite(buffer_m)) or float(buffer_m) <= 0.0:
+        return None
+
+    boundary_latlon = _boundary_df_to_latlon_list(boundary_df)
+    if len(boundary_latlon) < 3:
+        return None
+
+    # Même logique que Start Aid (UTM local + buffer négatif)
+    ctx = make_context_from_boundary(boundary_latlon)
+    to_utm: Transformer = ctx["to_utm"]
+    to_wgs: Transformer = ctx["to_wgs"]
+
+    boundary_xy = [to_utm.transform(lon, lat) for (lat, lon) in boundary_latlon]  # always_xy: lon,lat
+    poly = Polygon(boundary_xy)
+    if (not poly.is_valid) or poly.area <= 0:
+        poly = poly.buffer(0)
+
+    if poly.is_empty or poly.area <= 0:
+        return None
+
+    poly_buf = poly.buffer(-float(buffer_m))
+    if poly_buf.is_empty or poly_buf.area <= 0:
+        return None
+
+    # Exterior -> lon/lat -> df lat/lon
+    coords = list(poly_buf.exterior.coords)
+    rows = []
+    for i, (x, y) in enumerate(coords):
+        lon, lat = to_wgs.transform(x, y)  # returns lon,lat
+        rows.append({"seq": i, "lat": float(lat), "lon": float(lon)})
+
+    return pd.DataFrame(rows)
+
+
+
 
 def render_start_photo(page_title: str = "SailGP – Replay (RACE_START_COUNT FRA)", mode_override: str | None = None):
     st.title(page_title)
@@ -232,6 +306,11 @@ def render_start_photo(page_title: str = "SailGP – Replay (RACE_START_COUNT FR
     boats_prev = scale_latlon_always(boats_prev, "lat", "lon")
     marks = scale_latlon_always(marks, "lat", "lon")
 
+        # --- NEW: TTS FRA (en secondes, sans décimales)
+    fra_row = boats_now[boats_now["boat"] == "FRA"]
+    tts_fra = pd.to_numeric(fra_row["TTS_s"].iloc[0], errors="coerce") if not fra_row.empty else np.nan
+
+
     def _color(boat: str):
         if boat == "FRA":
             return [0, 100, 255, 230]
@@ -263,9 +342,23 @@ def render_start_photo(page_title: str = "SailGP – Replay (RACE_START_COUNT FR
     excluded_set = set(map(str, excluded))
     eligible_codes = [b for b in ALL_BOATS if b != "FRA" and b not in excluded_set]
 
-    # fleet AVG (barycentre) + vecteur barycentre (sur eligible_codes)
+        # fleet AVG (barycentre) + vecteur barycentre (sur eligible_codes)
     fleet_now = boats_now[boats_now["boat"].isin(eligible_codes)].dropna(subset=["lat", "lon"])
     fleet_prev = boats_prev[boats_prev["boat"].isin(eligible_codes)].dropna(subset=["lat", "lon"])
+
+    # NEW: TTK AVG = moyenne des TTK des bateaux éligibles (snapshot)
+    ttk_avg = pd.to_numeric(
+        boats_now.loc[boats_now["boat"].isin(eligible_codes), "TTK_s"],
+        errors="coerce",
+    ).mean()
+    ttk_avg = float(ttk_avg) if np.isfinite(ttk_avg) else np.nan
+
+    # NEW: TTS FRA (pour affichage bas-gauche)
+    tts_fra = pd.to_numeric(
+        boats_now.loc[boats_now["boat"] == "FRA", "TTS_s"],
+        errors="coerce",
+    )
+    tts_fra = float(tts_fra.iloc[0]) if (not tts_fra.empty and np.isfinite(tts_fra.iloc[0])) else np.nan
 
     if not fleet_now.empty:
         lat1 = float(fleet_now["lat"].mean())
@@ -283,7 +376,7 @@ def render_start_photo(page_title: str = "SailGP – Replay (RACE_START_COUNT FR
             "lat": lat1,
             "lon": lon1,
             "BSP_kmph": np.nan,
-            "TTK_s": np.nan,
+            "TTK_s": ttk_avg,          # NEW
             "TTS_s": np.nan,
             "COG_deg": np.nan,
             "color": _color("AVG_fleet"),
@@ -291,6 +384,7 @@ def render_start_photo(page_title: str = "SailGP – Replay (RACE_START_COUNT FR
             "VEC_DIST_m": d_avg,
         }])
         boats = pd.concat([boats, avg_row], ignore_index=True)
+
 
     # Trace FRA + AVG (cohérent avec le filtre)
     trace_rows = []
@@ -334,17 +428,26 @@ def render_start_photo(page_title: str = "SailGP – Replay (RACE_START_COUNT FR
         # FRA track via load_trace_boat (déjà en degrés)
         if fra_trace is not None and not fra_trace.empty:
             fra_track = fra_trace[["time_utc", "lat", "lon"]].copy()
+            # FRA
             fra_cross = last_left_to_right_crossing(fra_track, sl1_lat, sl1_lon, sl2_lat, sl2_lon)
             if fra_cross is not None:
-                # TTI = start_time - crossing_time (comme ton ancienne version)
-                tti = (start_time - fra_cross["time_utc"].to_pydatetime()).total_seconds()
+                cross_time = fra_cross["time_utc"].to_pydatetime()
+                tti = (start_time - cross_time).total_seconds()
+                bsp_kmph, ttk_s = _snapshot_metrics_at_time(cfg, cross_time, boat="FRA")
+
                 cross_rows.append({
                     "boat": "FRA",
+                    "time_utc": fra_cross["time_utc"],
                     "lat": float(fra_cross["lat"]),
                     "lon": float(fra_cross["lon"]),
+                    "d_pin_m": float(fra_cross["dist_sl2_m"]),
+                    "tti_s": float(tti),
+                    "bsp_kmph": float(bsp_kmph),
+                    "ttk_s": float(ttk_s),
                     "color": [0, 100, 255, 230],
-                    "label": f"{tti:.0f}s / {fra_cross['dist_sl2_m']:.0f}m",
+                    "label": f"{int(round(tti))}s / {int(round(fra_cross['dist_sl2_m']))}m",
                 })
+
 
         # AVG track déjà calculé ci-dessus si eligible_codes
         if eligible_codes:
@@ -361,16 +464,30 @@ def render_start_photo(page_title: str = "SailGP – Replay (RACE_START_COUNT FR
                 )
                 avg_cross = last_left_to_right_crossing(avg_track, sl1_lat, sl1_lon, sl2_lat, sl2_lon)
                 if avg_cross is not None:
-                    tti = (start_time - avg_cross["time_utc"].to_pydatetime()).total_seconds()
+                    cross_time = avg_cross["time_utc"].to_pydatetime()
+                    tti = (start_time - cross_time).total_seconds()
+
+                    bsp_kmph, ttk_s = _snapshot_metrics_at_time(cfg, cross_time, eligible_codes=eligible_codes)
+
                     cross_rows.append({
                         "boat": "AVG_fleet",
+                        "time_utc": avg_cross["time_utc"],
                         "lat": float(avg_cross["lat"]),
                         "lon": float(avg_cross["lon"]),
+                        "d_pin_m": float(avg_cross["dist_sl2_m"]),
+                        "tti_s": float(tti),
+                        "bsp_kmph": float(bsp_kmph),
+                        "ttk_s": float(ttk_s),
                         "color": [220, 30, 30, 230],
-                        "label": f"{tti:.0f}s / {avg_cross['dist_sl2_m']:.0f}m",
+                        "label": f"{int(round(tti))}s / {int(round(avg_cross['dist_sl2_m']))}m",
                     })
 
-    cross_df = pd.DataFrame(cross_rows, columns=["boat", "lat", "lon", "color", "label"])
+
+    cross_df = pd.DataFrame(
+    cross_rows,
+    columns=["boat", "time_utc", "lat", "lon", "d_pin_m", "tti_s", "bsp_kmph", "ttk_s", "color", "label"],
+    )
+
 
     # TWD/TWS FRA (affichage)
     tw = load_twd_tws_fra(cfg, start_time, offset_s, half_window_s=2)
@@ -380,13 +497,27 @@ def render_start_photo(page_title: str = "SailGP – Replay (RACE_START_COUNT FR
             f"TWS FRA: {tw.get('TWS_MHU_SGP_km_h_1', float('nan')):.1f} km/h"
         )
 
+
+
+    # --- NEW: buffer boundary synchronisé avec Start Aid via session_state
+    buffer_m = float(st.session_state.get("size_buffer_BDY_m", 15.0))
+    boundary_buffer_df = _compute_boundary_buffer_df(boundary_df, buffer_m)
+
+
     deck = build_deck(
         boats_df=boats,
         marks_df=marks,
         cross_df=cross_df,
         trace_df=trace_df,
         boundary_df=boundary_df,
+        boundary_buffer_df=boundary_buffer_df,  # NEW
+        tts_s=tts_fra,
     )
+
+
+
+
+
     st.pydeck_chart(deck, width="stretch")
 
 
@@ -403,6 +534,10 @@ def render_start_photo(page_title: str = "SailGP – Replay (RACE_START_COUNT FR
         "eligible_codes": eligible_codes,
         "cross_df": cross_df,
         "trace_df": trace_df,
+        "tts_fra": tts_fra,
+        "boundary_buffer_df": boundary_buffer_df,
+
+
     }
 
 
