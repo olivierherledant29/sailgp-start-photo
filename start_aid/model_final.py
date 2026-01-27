@@ -355,5 +355,3 @@ def compute_all_geometry_and_times(
         "SP_xy": SP_xy,
     })
     return out
-
-    return out
