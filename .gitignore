@@ -18,3 +18,8 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+
+# Polaires (on versionne ces CSV-là)
+!start_aid/polars/
+!start_aid/polars/*.csv
