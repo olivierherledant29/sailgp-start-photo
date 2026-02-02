@@ -63,3 +63,47 @@ def parse_course_limit_xml(xml_bytes: bytes) -> pd.DataFrame:
     df = df.loc[keep].drop(columns=["_key"]).reset_index(drop=True)
 
     return df
+
+
+def parse_marks_xml(xml_bytes: bytes) -> pd.DataFrame:
+    """Parse mark positions (e.g. SL1/SL2/M1) from the SailGP XML.
+
+    Expected structure (common in SailGP exports):
+      <Course> ... <Mark Name="SL1" TargetLat="..." TargetLng="..." ... />
+
+    Returns a DataFrame with columns: mark, lat, lon (float).
+    If no marks found, returns empty DataFrame with those columns.
+    """
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception:
+        return pd.DataFrame(columns=["mark", "lat", "lon"])
+
+    rows = []
+    for m in root.findall(".//Mark"):
+        name = (m.attrib.get("Name") or m.attrib.get("name") or "").strip()
+        if not name:
+            continue
+
+        # Common attribute names
+        lat_s = m.attrib.get("TargetLat") or m.attrib.get("lat") or m.attrib.get("Lat")
+        lon_s = m.attrib.get("TargetLng") or m.attrib.get("lng") or m.attrib.get("Lon") or m.attrib.get("LonDeg")
+
+        try:
+            lat = float(lat_s) if lat_s is not None else float("nan")
+            lon = float(lon_s) if lon_s is not None else float("nan")
+        except Exception:
+            lat, lon = float("nan"), float("nan")
+
+        if not (pd.notna(lat) and pd.notna(lon)):
+            continue
+
+        rows.append({"mark": name, "lat": lat, "lon": lon})
+
+    if not rows:
+        return pd.DataFrame(columns=["mark", "lat", "lon"])
+
+    df = pd.DataFrame(rows)
+    # Keep first occurrence for duplicates
+    df = df.dropna(subset=["mark", "lat", "lon"]).drop_duplicates(subset=["mark"], keep="first").reset_index(drop=True)
+    return df
