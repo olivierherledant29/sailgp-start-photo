@@ -90,6 +90,8 @@ SECOND_COLORS = {
     ("LL_SL1",     "to_SL1"): [112, 128, 144],
     ("LL_SL1",     "to_SL2"): [0, 128, 128],
     ("LL_SL1",     "to_SP"):  [138, 43, 226],
+    # NEW trajectory (PI->M_PAR_SL2->SL2_7m)
+    ("PAR_SL2",    "to_SL2"): [255, 255, 0],
 }
 
 
@@ -209,12 +211,26 @@ def compute_all_geometry_and_times(
     # --- Special points on start line
     SL1_7m_xy, SL2_7m_xy, SP_xy = compute_startline_special_points(SL1_xy, SL2_xy, X_percent, offset_m=7.0)
 
+    # --- NEW: Manoeuvre point = intersection(ray_PI, parallel layline through SL2_7m)
+    layline_SL2_7m = LineString([tuple(SL2_7m_xy), tuple(SL2_7m_xy + dir_UW * 80000.0)])
+    p_par = compute_forward_intersection_between_lines(
+        ray_PI=ray_PI,
+        PI_xy=PI_xy,
+        dir_PI=dir_port,
+        layline=layline_SL2_7m,
+        SL1_xy=SL2_7m_xy,
+        dir_lay=dir_UW,
+    )
+    M_PAR_SL2_xy = None
+    if p_par is not None:
+        M_PAR_SL2_xy = np.array([p_par.x, p_par.y], dtype=float)
+
     DESTS = {
         "to_SL1": SL1_7m_xy,
         "to_SL2": SL2_7m_xy,
         "to_SP": SP_xy,
     }
-    GROUPS = {"buffer_BDY": M_buffer_BDY_xy, "LL_SL1": M_LL_SL1_xy}
+    GROUPS = {"buffer_BDY": M_buffer_BDY_xy, "LL_SL1": M_LL_SL1_xy, "PAR_SL2": M_PAR_SL2_xy}
 
     # --- Paths (for map)
     results = []
@@ -229,6 +245,9 @@ def compute_all_geometry_and_times(
     if M_LL_SL1_xy is not None:
         M_ll = xy_to_ll(to_wgs, M_LL_SL1_xy[0], M_LL_SL1_xy[1])
         first_leg_paths.append({"path": [[PI_ll[1], PI_ll[0]], [M_ll[1], M_ll[0]]], "name": "PI->M_LL_SL1"})
+    if M_PAR_SL2_xy is not None:
+        M_ll = xy_to_ll(to_wgs, M_PAR_SL2_xy[0], M_PAR_SL2_xy[1])
+        first_leg_paths.append({"path": [[PI_ll[1], PI_ll[0]], [M_ll[1], M_ll[0]]], "name": "PI->M_PAR_SL2"})
 
     # --- Evaluate trajectories
     bsp_retour_vals = []
@@ -240,7 +259,9 @@ def compute_all_geometry_and_times(
         d1 = float(np.linalg.norm(M_xy - PI_xy))
         t1 = meters_to_seconds(d1, float(bsp_approche_bab))
 
-        for dname, target_xy in DESTS.items():
+        dests_iter = DESTS.items() if gname != "PAR_SL2" else [("to_SL2", SL2_7m_xy)]
+
+        for dname, target_xy in dests_iter:
             # Return heading and TWA (abs) for this segment
             if float(np.linalg.norm(target_xy - M_xy)) < 1e-6:
                 heading_return = float("nan")
@@ -259,7 +280,7 @@ def compute_all_geometry_and_times(
             ttk = float(TTS_intersection) - t_total
             ttk_before_tack = ttk + float(M_lost)
 
-            color = SECOND_COLORS[(gname, dname)]
+            color = SECOND_COLORS.get((gname, dname), [255, 255, 255])
 
             M_ll = xy_to_ll(to_wgs, M_xy[0], M_xy[1])
             end_ll = xy_to_ll(to_wgs, target_xy[0], target_xy[1])
@@ -344,6 +365,7 @@ def compute_all_geometry_and_times(
         "dir_UW": dir_UW,
         "M_buffer_BDY_xy": M_buffer_BDY_xy,
         "M_LL_SL1_xy": M_LL_SL1_xy,
+        "M_PAR_SL2_xy": M_PAR_SL2_xy,
         "lay_vis_SL1": lay_vis_SL1,
         "lay_vis_SL2": lay_vis_SL2,
         "first_leg_paths": first_leg_paths,
@@ -354,6 +376,4 @@ def compute_all_geometry_and_times(
         "SL2_7m_xy": SL2_7m_xy,
         "SP_xy": SP_xy,
     })
-    return out
-
     return out
