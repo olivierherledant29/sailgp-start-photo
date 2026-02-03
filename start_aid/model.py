@@ -91,9 +91,8 @@ SECOND_COLORS = {
     ("LL_SL1",     "to_SL2"): [0, 128, 128],
     ("LL_SL1",     "to_SP"):  [138, 43, 226],
     # NEW trajectory (PI->M_PAR_SL2->SL2_7m)
-    ("PAR_SL2",    "to_SL2"): [255, 255, 0],
+    ("PAR_SL2",    "to_SL2"): [255, 140, 0],
 }
-
 
 def compute_startline_special_points(
     SL1_xy: np.ndarray,

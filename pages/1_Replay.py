@@ -44,15 +44,19 @@ def _fmt_line(boat_code: str, label: str):
 
     return f"{label}: " + " / ".join(parts)
 
+boat_ref = out_main.get("boat_ref", "FRA")
 
-line_fra = _fmt_line("FRA", "FRA")
+line_ref = _fmt_line(boat_ref, boat_ref)
 line_avg = _fmt_line("AVG_fleet", "fleet_avg")
+
 
 st.markdown(
     f"""
     <div style="margin:6px 0 10px 0;">
-        <span style="color:#0064FF;font-weight:600">{line_fra}</span><br/>
+        <span style="color:#0064FF;font-weight:600">{line_ref}</span><br/>
         <span style="color:#DC1E1E;font-weight:600">{line_avg}</span>
+
+  
     </div>
     """,
     unsafe_allow_html=True,
