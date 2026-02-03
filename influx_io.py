@@ -24,7 +24,6 @@ TOKEN_ENV = "SailGP_TOKEN"
 
 GPS_SCALE = 1e7  # degrés * 1e7 (SailGP)
 
-
 ALL_BOATS = ["AUS", "BRA", "CAN", "DEN", "ESP", "FRA", "GBR", "GER", "ITA", "NZL", "SUI", "USA", "SWE"]
 MARKS = ["SL1", "SL2", "M1"]
 
@@ -64,7 +63,6 @@ def get_cfg() -> InfluxCfg:
 
 
 def get_client(cfg: InfluxCfg) -> InfluxDBClient:
-    # verify_ssl=False pour éviter les warnings en local
     return InfluxDBClient(url=cfg.url, token=cfg.token, org=cfg.org, verify_ssl=False)
 
 
@@ -76,10 +74,6 @@ def iso_z(dt: datetime) -> str:
 
 
 def snapshot_window_times(start_gun_utc: datetime, offset_s: int, half_window_s: int) -> tuple[datetime, datetime]:
-    """
-    IMPORTANT: Influx refuse range(start=..., stop=...) si start==stop.
-    On force une fenêtre minimale de 1 seconde.
-    """
     if start_gun_utc.tzinfo is None:
         start_gun_utc = start_gun_utc.replace(tzinfo=timezone.utc)
 
@@ -91,11 +85,6 @@ def snapshot_window_times(start_gun_utc: datetime, offset_s: int, half_window_s:
 
 
 def scale_latlon_always(df: pd.DataFrame, lat_col="lat", lon_col="lon") -> pd.DataFrame:
-    """
-    - GPS_unk (bateaux) parfois en degrés * 1e7
-    - MDSS_deg (marques) déjà en degrés
-    Heuristique: si |val| > 180 => /1e7
-    """
     out = df.copy()
 
     if lat_col in out.columns:
@@ -113,6 +102,21 @@ def scale_latlon_always(df: pd.DataFrame, lat_col="lat", lon_col="lon") -> pd.Da
             out[lon_col] = lon
 
     return out
+
+
+def _query_data_frame_safe(cfg: InfluxCfg, flux: str) -> pd.DataFrame:
+    """Évite qu'une requête qui échoue fasse planter toute la page."""
+    try:
+        client = get_client(cfg)
+        df = client.query_api().query_data_frame(org=cfg.org, query=flux)
+    except Exception:
+        return pd.DataFrame()
+
+    if df is None:
+        return pd.DataFrame()
+    if isinstance(df, list):
+        return pd.concat(df, ignore_index=True) if df else pd.DataFrame()
+    return df
 
 
 def query_mean_by_boat(
@@ -135,12 +139,9 @@ from(bucket: "{cfg.bucket}")
   |> keep(columns: ["boat", "_value"])
   |> rename(columns: {{_value: "value"}})
 '''
-    client = get_client(cfg)
-    df = client.query_api().query_data_frame(org=cfg.org, query=flux)
+    df = _query_data_frame_safe(cfg, flux)
 
-    if isinstance(df, list):
-        df = pd.concat(df, ignore_index=True) if df else pd.DataFrame(columns=["boat", "value"])
-    if df is None or df.empty:
+    if df.empty:
         return pd.DataFrame(columns=["boat", "value"])
 
     out = df[["boat", "value"]].copy()
@@ -169,12 +170,9 @@ from(bucket: "{cfg.bucket}")
   |> keep(columns: ["boat", "_value"])
   |> rename(columns: {{_value: "value"}})
 '''
-    client = get_client(cfg)
-    df = client.query_api().query_data_frame(org=cfg.org, query=flux)
+    df = _query_data_frame_safe(cfg, flux)
 
-    if isinstance(df, list):
-        df = pd.concat(df, ignore_index=True) if df else pd.DataFrame(columns=["boat", "value"])
-    if df is None or df.empty:
+    if df.empty:
         return pd.DataFrame(columns=["boat", "value"])
 
     out = df[["boat", "value"]].copy()
@@ -235,12 +233,9 @@ from(bucket: "{cfg.bucket}")
   |> keep(columns: ["_time","boat","LATITUDE_GPS_unk","LONGITUDE_GPS_unk"])
   |> rename(columns: {{_time:"time_utc", LATITUDE_GPS_unk:"lat_raw", LONGITUDE_GPS_unk:"lon_raw"}})
 '''
-    client = get_client(cfg)
-    df = client.query_api().query_data_frame(org=cfg.org, query=flux)
+    df = _query_data_frame_safe(cfg, flux)
 
-    if isinstance(df, list):
-        df = pd.concat(df, ignore_index=True) if df else pd.DataFrame(columns=["time_utc", "boat", "lat_raw", "lon_raw"])
-    if df is None or df.empty:
+    if df.empty:
         return pd.DataFrame(columns=["time_utc", "boat", "lat_raw", "lon_raw"])
 
     df["time_utc"] = pd.to_datetime(df["time_utc"], utc=True)
@@ -250,7 +245,7 @@ from(bucket: "{cfg.bucket}")
 @st.cache_data(show_spinner=False, ttl=60)
 def load_trace_boat(cfg: InfluxCfg, boat: str, start_utc: datetime, stop_utc: datetime) -> pd.DataFrame:
     df = load_latlon_timeseries_1s(cfg, [boat], start_utc, stop_utc)
-    if df is None or df.empty:
+    if df.empty:
         return pd.DataFrame(columns=["time_utc", "boat", "lat", "lon"])
 
     out = df.copy()
@@ -267,16 +262,22 @@ def load_trace_boat(cfg: InfluxCfg, boat: str, start_utc: datetime, stop_utc: da
 
 
 @st.cache_data(show_spinner=False, ttl=60)
-def load_twd_tws_fra(cfg: InfluxCfg, start_gun_utc: datetime, offset_s: int, half_window_s: int = 2) -> dict:
+def load_twd_tws_boat(
+    cfg: InfluxCfg,
+    start_gun_utc: datetime,
+    offset_s: int,
+    boat: str,
+    half_window_s: int = 2,
+) -> dict:
     df = load_boat_snapshot(cfg, start_gun_utc, offset_s, half_window_s=half_window_s)
     if df is None or df.empty:
         return {}
 
-    fra = df[df["boat"].astype(str) == "FRA"]
-    if fra.empty:
+    r0 = df[df["boat"].astype(str) == str(boat)]
+    if r0.empty:
         return {}
 
-    r = fra.iloc[0]
+    r = r0.iloc[0]
     twd = pd.to_numeric(r.get("TWD_MHU_SGP_deg"), errors="coerce")
     tws = pd.to_numeric(r.get("TWS_MHU_SGP_km_h_1"), errors="coerce")
 
@@ -288,11 +289,17 @@ def load_twd_tws_fra(cfg: InfluxCfg, start_gun_utc: datetime, offset_s: int, hal
     return out
 
 
+# Backward-compatible wrapper
+@st.cache_data(show_spinner=False, ttl=60)
+def load_twd_tws_fra(cfg: InfluxCfg, start_gun_utc: datetime, offset_s: int, half_window_s: int = 2) -> dict:
+    return load_twd_tws_boat(cfg, start_gun_utc, offset_s, boat="FRA", half_window_s=half_window_s)
+
+
 # -----------------------
-# Start detection (RACE_START_COUNT FRA)
+# Start detection (RACE_START_COUNT)
 # -----------------------
 @st.cache_data(show_spinner=False, ttl=300)
-def load_race_start_count_day_fra(cfg: InfluxCfg, day_utc: date) -> pd.DataFrame:
+def load_race_start_count_day(cfg: InfluxCfg, day_utc: date, boat: str) -> pd.DataFrame:
     start_utc = datetime.combine(day_utc, time(0, 0, 0), tzinfo=timezone.utc)
     stop_utc = start_utc + timedelta(days=1)
 
@@ -301,23 +308,26 @@ from(bucket: "{cfg.bucket}")
   |> range(start: {iso_z(start_utc)}, stop: {iso_z(stop_utc)})
   |> filter(fn: (r) => r["_field"] == "value")
   |> filter(fn: (r) => r["_measurement"] == "RACE_START_COUNT_unk")
-  |> filter(fn: (r) => r["boat"] == "FRA")
+  |> filter(fn: (r) => r["boat"] == "{str(boat)}")
   |> aggregateWindow(every: 1s, fn: mean, createEmpty: false)
   |> keep(columns: ["_time","_value"])
   |> rename(columns: {{_time: "time_utc", _value: "race_start_count"}})
 '''
-    client = get_client(cfg)
-    df = client.query_api().query_data_frame(org=cfg.org, query=flux)
+    df = _query_data_frame_safe(cfg, flux)
 
-    if isinstance(df, list):
-        df = pd.concat(df, ignore_index=True) if df else pd.DataFrame(columns=["time_utc", "race_start_count"])
-    if df is None or df.empty:
+    if df.empty:
         return pd.DataFrame(columns=["time_utc", "race_start_count"])
 
     df = df[["time_utc", "race_start_count"]].copy()
     df["time_utc"] = pd.to_datetime(df["time_utc"], utc=True)
     df["race_start_count"] = pd.to_numeric(df["race_start_count"], errors="coerce")
     return df.sort_values("time_utc").reset_index(drop=True)
+
+
+# Backward-compatible wrapper
+@st.cache_data(show_spinner=False, ttl=300)
+def load_race_start_count_day_fra(cfg: InfluxCfg, day_utc: date) -> pd.DataFrame:
+    return load_race_start_count_day(cfg, day_utc, boat="FRA")
 
 
 def detect_starts_from_race_start_count(df_count: pd.DataFrame) -> pd.DataFrame:
