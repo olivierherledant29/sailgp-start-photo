@@ -4,7 +4,7 @@ st.set_page_config(page_title="SailGP Start Photo", layout="wide")
 st.title("SailGP – Start Photo")
 
 st.write("Choisir le mode :")
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 
 with c1:
     st.subheader("Replay")
@@ -20,6 +20,12 @@ with c2:
 
 with c3:
     st.subheader("start_aid only")
-    st.write("ouvrir start_aid, lit seulement xml")
+    st.write("ouvrir start_aid, lit seulement xml et polaire")
     if st.button("Ouvrir start_aid"):
         st.switch_page("pages/3_Start_Aid.py")
+
+with c4:
+    st.subheader("routeur")
+    st.write("ouvrir routeur, lit seulement xml et polaire")
+    if st.button("Ouvrir routeur"):
+        st.switch_page("pages/4_Routeur.py")
