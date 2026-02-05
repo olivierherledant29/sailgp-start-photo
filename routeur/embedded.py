@@ -173,8 +173,20 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
     gybe_loss_s = st.number_input("Perte gybe (s)", min_value=0.0, max_value=30.0, value=5.0, step=1.0)
 
     st.subheader("Polaires")
+
+
+
     polars_dir = Path(__file__).resolve().parent / "polars"
+    fallback_dir = Path(__file__).resolve().parents[1] / "start_aid" / "polars"
+
     polar_files = list_polar_files(polars_dir)
+    if not polar_files and fallback_dir.exists():
+            polars_dir = fallback_dir
+            polar_files = list_polar_files(polars_dir)
+
+    
+    
+    
     if not polar_files:
         st.warning(f"Aucun fichier de polaires trouvé dans: {polars_dir}")
         return None, None
