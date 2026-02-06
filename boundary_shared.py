@@ -19,16 +19,17 @@ def sidebar_boundary_uploader() -> pd.DataFrame:
     )
 
     if xml_file is None:
-        # Keep keys clean when nothing is uploaded
         st.session_state.pop("marks_df", None)
+        st.session_state.pop("boundary_xml_name", None)
         return pd.DataFrame(columns=["ring", "seq", "lat", "lon"])
+
+    # ✅ Stocker le nom pour les pages qui veulent en déduire un TWD
+    st.session_state["boundary_xml_name"] = getattr(xml_file, "name", None)
 
     xml_bytes = xml_file.getvalue()
 
-    # Boundary polygon
     boundary_df = parse_course_limit_xml(xml_bytes)
 
-    # Also parse marks from the same XML, store in session_state for pages that need it
     try:
         marks_df = parse_marks_xml(xml_bytes)
     except Exception:

@@ -7,56 +7,33 @@ from shapely.geometry import Point as ShapelyPoint
 from .geo import heading_to_unit_vector
 
 
-# =========================================================
-# Angles helpers
-# =========================================================
 def wrap180(a: float) -> float:
-    """Normalize angle to (-180, 180]."""
     x = (float(a) + 180.0) % 360.0 - 180.0
     return 180.0 if x == -180.0 else x
 
 
 def twa_from_twd_hdg(twd: float, hdg: float) -> float:
-    """
-    SIGNED TWA in (-180,180] with your convention:
-      TWA = TWD - HDG
-    Positive => tribord, negative => babord
-    """
     return wrap180(float(twd) - float(hdg))
 
 
 def hdg_from_twd_twa(twd: float, twa: float) -> float:
-    """
-    Inverse mapping consistent with your convention:
-      HDG = TWD - TWA
-    """
     return (float(twd) - float(twa)) % 360.0
 
 
 def _bearing_deg_xy(p0: tuple[float, float], p1: tuple[float, float]) -> float:
-    """
-    Bearing in degrees, 0=N, 90=E, from XY (meters) where +x=East, +y=North.
-    """
     x0, y0 = p0
     x1, y1 = p1
     dx = float(x1 - x0)
     dy = float(y1 - y0)
-    ang = math.degrees(math.atan2(dx, dy))  # atan2(x, y) => 0 at North
+    ang = math.degrees(math.atan2(dx, dy))  # 0=N, 90=E
     return ang % 360.0
 
 
 def _twa_signed_to_target_xy(from_xy: np.ndarray, to_xy: np.ndarray, twd_deg: float) -> float:
-    """Signed TWA to target using your convention TWA=TWD-HDG."""
-    hdg = _bearing_deg_xy(
-        (float(from_xy[0]), float(from_xy[1])),
-        (float(to_xy[0]), float(to_xy[1])),
-    )
+    hdg = _bearing_deg_xy((float(from_xy[0]), float(from_xy[1])), (float(to_xy[0]), float(to_xy[1])))
     return twa_from_twd_hdg(float(twd_deg), float(hdg))
 
 
-# =========================================================
-# Units
-# =========================================================
 def kmh_to_mps(v_kmh: float) -> float:
     return float(v_kmh) / 3.6
 
@@ -66,15 +43,7 @@ def meters_to_seconds(dist_m: float, bsp_kmh: float) -> float:
     return float(dist_m) / v if v > 1e-6 else float("inf")
 
 
-# =========================================================
-# Gate bias
-# =========================================================
 def gate_bias_m(mark1_xy: np.ndarray, mark2_xy: np.ndarray, TWD: float) -> float:
-    """
-    Bias = projection of segment (mark2 - mark1) onto TWD axis.
-    Axis direction is heading_to_unit_vector(TWD).
-    Returned in meters, signed (sign convention validated by you).
-    """
     v = np.array(mark2_xy, dtype=float) - np.array(mark1_xy, dtype=float)
     u = heading_to_unit_vector(float(TWD))
     return float(np.dot(v, u))
@@ -82,27 +51,12 @@ def gate_bias_m(mark1_xy: np.ndarray, mark2_xy: np.ndarray, TWD: float) -> float
 
 def compute_gate_biases(marks_xy: dict[str, np.ndarray], TWD: float) -> dict:
     out = {}
-    if "LG1" in marks_xy and "LG2" in marks_xy:
-        out["LW_gate_bias_m"] = gate_bias_m(marks_xy["LG1"], marks_xy["LG2"], float(TWD))
-    else:
-        out["LW_gate_bias_m"] = float("nan")
-
-    if "WG1" in marks_xy and "WG2" in marks_xy:
-        out["WW_gate_bias_m"] = gate_bias_m(marks_xy["WG1"], marks_xy["WG2"], float(TWD))
-    else:
-        out["WW_gate_bias_m"] = float("nan")
-
+    out["LW_gate_bias_m"] = gate_bias_m(marks_xy["LG1"], marks_xy["LG2"], float(TWD)) if ("LG1" in marks_xy and "LG2" in marks_xy) else float("nan")
+    out["WW_gate_bias_m"] = gate_bias_m(marks_xy["WG1"], marks_xy["WG2"], float(TWD)) if ("WG1" in marks_xy and "WG2" in marks_xy) else float("nan")
     return out
 
 
-# =========================================================
-# VMG optima
-# =========================================================
 def compute_vmg_optima(TWS_ref_kmh, polar_bsp_kmh, twa_candidates_deg):
-    """
-    best_uw: maximize bsp*cos(twa_abs)
-    best_dw: minimize bsp*cos(twa_abs)  (most negative)
-    """
     best_uw = {"vmg": -1e9, "twa": float("nan"), "bsp": float("nan")}
     best_dw = {"vmg": +1e9, "twa": float("nan"), "bsp": float("nan")}
 
@@ -120,9 +74,6 @@ def compute_vmg_optima(TWS_ref_kmh, polar_bsp_kmh, twa_candidates_deg):
     return best_uw, best_dw
 
 
-# =========================================================
-# Core simulator (Forward + Rear)
-# =========================================================
 def _simulate_leg_with_flips(
     *,
     geom,
@@ -131,36 +82,18 @@ def _simulate_leg_with_flips(
     TWD: float,
     TWS_ref_kmh: float,
     polar_bsp_kmh,
-    twa_abs_forward: float,   # TWA_vmg_DW (positive, forward reference)
-    bsp_sailed_kmph: float,   # constant speed during 1 Hz stepping
-    start_tack_sign: int,     # +1 tribord, -1 babord in EVALUATION convention
+    twa_abs_forward: float,
+    bsp_sailed_kmph: float,
+    start_tack_sign: int,
     gybe_loss_s: float,
     reach_m: float,
     max_steps: int,
     label: str,
     include_events: bool = True,
-    feasibility_mode: str = "forward",  # "forward" | "rear"
+    feasibility_mode: str = "forward",  # forward | rear
 ):
-    """
-    forward:
-      sailed TWA = ±TWA_vmg_DW
-      eval TWA to dest = twa_to_dest
-      direct if abs(eval) <= TWA_vmg_DW
-
-    rear:
-      sailed TWA = wrap180(±TWA_vmg_DW + 180)
-      eval TWA to dest = wrap180(twa_to_dest + 180)
-
-      IMPORTANT (your spec):
-        direct rear feasible if (180 - abs(twa_to_dest)) < TWA_vmg_DW
-        but abs(wrap180(twa_to_dest+180)) == 180 - abs(twa_to_dest)
-        => direct if abs(eval) < TWA_vmg_DW
-    """
-
     def twa_to_dest_signed(pos_xy: np.ndarray) -> float:
         return float(_twa_signed_to_target_xy(pos_xy, dest_xy, float(TWD)))
-
-
 
     poly_buffer = geom.get("poly_buffer", None)
 
@@ -185,31 +118,22 @@ def _simulate_leg_with_flips(
     twa_abs_forward = float(abs(twa_abs_forward))
 
     def twa_sailed_from_sign(tack_sign: int) -> float:
-        """Signed TWA that we actually sail with."""
         if feasibility_mode == "rear":
             return wrap180(float(tack_sign) * twa_abs_forward + 180.0)
         return float(tack_sign) * twa_abs_forward
 
     def twa_eval_to_dest(pos_xy: np.ndarray) -> float:
-        """Signed TWA used ONLY for feasibility (swap180 in rear)."""
         twa_to_dest = float(_twa_signed_to_target_xy(pos_xy, dest_xy, float(TWD)))
         if feasibility_mode == "rear":
             return wrap180(twa_to_dest + 180.0)
         return twa_to_dest
 
-    # -----------------------------
-    # ONLY CHANGE: direct feasibility in REAR
-    # -----------------------------
     def direct_is_feasible(twa_eval: float) -> bool:
         eps = 1e-9
         if feasibility_mode == "rear":
-            # abs(twa_eval) == 180 - abs(twa_to_dest)
-            # spec: (180 - abs(twa_to_dest)) < TWA_vmg_DW  => abs(twa_eval) < TWA_vmg_DW
             return abs(twa_eval) < twa_abs_forward + eps
-        # forward unchanged
         return abs(twa_eval) <= twa_abs_forward + eps
 
-    # state
     tack_sign = +1 if start_tack_sign >= 0 else -1
     twa_sailed = twa_sailed_from_sign(tack_sign)
 
@@ -221,12 +145,9 @@ def _simulate_leg_with_flips(
 
     def do_flip(at_xy: np.ndarray, reason: str, twa_eval: float | None = None):
         nonlocal tack_sign, twa_sailed, time_s
-
         prev = float(twa_sailed)
         tack_sign *= -1
         twa_sailed = twa_sailed_from_sign(tack_sign)
-
-        # In this router: flip => empannage (penalty +1)
         gybe_points_xy.append(at_xy.copy())
         time_s += float(gybe_loss_s)
         log(
@@ -241,16 +162,11 @@ def _simulate_leg_with_flips(
             n=len(gybe_points_xy),
         )
 
-    # -----------------
-    # Direct at start?
-    # -----------------
     twa_eval_start = float(twa_eval_to_dest(pos))
     if direct_is_feasible(twa_eval_start):
-        # keep existing behavior (as per your request: only detection change)
         twa_to_dest = float(twa_to_dest_signed(pos))
         if abs(twa_to_dest) > 1e-6 and sign(twa_to_dest) != sign(twa_sailed):
             do_flip(pos, reason="direct_start", twa_eval=twa_eval_start)
-
 
         dist = float(np.linalg.norm(dest_xy - pos))
         bsp_direct = float(polar_bsp_kmh(float(TWS_ref_kmh), float(abs(twa_eval_start))))
@@ -260,6 +176,7 @@ def _simulate_leg_with_flips(
 
         return {
             "label": label,
+            "traj": label,
             "route_path_xy": route_path_xy,
             "gybe_points_xy": gybe_points_xy,
             "time_total_s": float(time_s),
@@ -270,15 +187,10 @@ def _simulate_leg_with_flips(
             "feasibility_mode": feasibility_mode,
         }
 
-    # -----------------
-    # Simulation at 1 Hz
-    # -----------------
     v_mps = kmh_to_mps(float(bsp_sailed_kmph))
     step_m = float(v_mps) * 1.0
 
     for step_i in range(int(max_steps)):
-
-        # close enough => finish (maybe flip before direct)
         if float(np.linalg.norm(dest_xy - pos)) <= float(reach_m):
             twa_now = float(twa_eval_to_dest(pos))
             if abs(twa_now) > 1e-6 and sign(twa_now) != sign(twa_sailed):
@@ -292,30 +204,26 @@ def _simulate_leg_with_flips(
             log("FINISH", label=label, step=step_i, reason="close_enough")
             break
 
-        # advance 1s on current sailed TWA
         heading = hdg_from_twd_twa(float(TWD), float(twa_sailed))
         dir_xy = heading_to_unit_vector(heading)
         pos_next = pos + dir_xy * step_m
 
-        # buffer hit => flip
-        if not inside_buffer(pos_next):
-            do_flip(pos, reason="buffer")
-            continue
+        if not geom.get("poly_buffer", None) is None:
+            if not inside_buffer(pos_next):
+                do_flip(pos, reason="buffer")
+                continue
 
-        # accept step
         dist_step = float(np.linalg.norm(pos_next - pos))
         dist_total += dist_step
         time_s += 1.0
         pos = pos_next
         route_path_xy.append(pos.copy())
 
-        # direct becomes feasible?
         twa_here = float(twa_eval_to_dest(pos))
         if direct_is_feasible(twa_here):
             twa_to_dest = float(twa_to_dest_signed(pos))
             if abs(twa_to_dest) > 1e-6 and sign(twa_to_dest) != sign(twa_sailed):
                 do_flip(pos, reason="before_direct_feasible", twa_eval=twa_here)
-
 
             dist_last = float(np.linalg.norm(dest_xy - pos))
             bsp_direct = float(polar_bsp_kmh(float(TWS_ref_kmh), float(abs(twa_here))))
@@ -327,6 +235,7 @@ def _simulate_leg_with_flips(
 
     return {
         "label": label,
+        "traj": label,
         "route_path_xy": route_path_xy,
         "gybe_points_xy": gybe_points_xy,
         "time_total_s": float(time_s),
@@ -338,9 +247,6 @@ def _simulate_leg_with_flips(
     }
 
 
-# =========================================================
-# Public API — First DW from M1 (A/B + A'/B')
-# =========================================================
 def compute_first_dw_from_M1(
     ctx,
     geom,
@@ -366,22 +272,18 @@ def compute_first_dw_from_M1(
 
     best_uw, best_dw = compute_vmg_optima(float(TWS_ref_kmh), polar_bsp_kmh, twa_candidates_deg)
 
-    # forward VMG DW
-    TWA_vmg_DW_abs = float(best_dw["twa"])  # positive
+    TWA_vmg_DW_abs = float(best_dw["twa"])
     BSP_vmg_DW = float(best_dw["bsp"])
     VMG_vmg_DW = float(best_dw["vmg"])
 
-    # UW info
     TWA_vmg_UW_abs = float(best_uw["twa"])
     BSP_vmg_UW = float(best_uw["bsp"])
     VMG_vmg_UW = float(best_uw["vmg"])
 
-    # rear speed lookup: abs(180 - TWA_vmg_DW)
     TWA_vmg_DW_rear_abs = abs(180.0 - TWA_vmg_DW_abs)
     BSP_vmg_DW_rear = float(polar_bsp_kmh(float(TWS_ref_kmh), float(TWA_vmg_DW_rear_abs)))
     VMG_vmg_DW_rear = float(BSP_vmg_DW_rear * math.cos(math.radians(float(TWA_vmg_DW_rear_abs))))
 
-    # Forward A / B (M1 -> MLG)
     route_A = _simulate_leg_with_flips(
         geom=geom,
         start_xy=M1_xy,
@@ -418,7 +320,6 @@ def compute_first_dw_from_M1(
         feasibility_mode="forward",
     )
 
-    # Rear A' / B' (MLG -> M1) — leave everything else unchanged
     route_Ap = _simulate_leg_with_flips(
         geom=geom,
         start_xy=MLG_xy,
@@ -455,6 +356,33 @@ def compute_first_dw_from_M1(
         feasibility_mode="rear",
     )
 
+    # ---- Naming updates requested
+    route_A["traj_name"] = "bear away rebond boundary jusqu'à layline milieu de gate"
+    route_B["traj_name"] = "gybe set puis rebond boundary jusqu'à layline milieu de gate"
+
+    nA = int(route_A.get("n_gybes", 0))
+    nB = int(route_B.get("n_gybes", 0))
+
+    show_ApBp = True
+    if (nA == 0) or (nB == 0) or (nA == 1 and nB == 1):
+        show_ApBp = False
+
+    route_A["visible"] = True
+    route_B["visible"] = True
+    route_Ap["visible"] = bool(show_ApBp)
+    route_Bp["visible"] = bool(show_ApBp)
+
+    route_Ap["traj_name"] = route_Ap.get("traj", "A'")
+    route_Bp["traj_name"] = route_Bp.get("traj", "B'")
+
+    if show_ApBp and nA > 1:
+        if (nA % 2) == 0:
+            route_Ap["traj_name"] = "bear away et open gybe"
+            route_Bp["traj_name"] = "gybe set puis open gybe"
+        else:
+            route_Ap["traj_name"] = "gybe set puis open gybe"
+            route_Bp["traj_name"] = "bear away et open gybe"
+
     return {
         "category": "first_DW_from_M1",
         "M1_xy": M1_xy.copy(),
@@ -473,5 +401,5 @@ def compute_first_dw_from_M1(
         "BSP_vmg_DW_rear_kmph": float(BSP_vmg_DW_rear),
         "VMG_vmg_DW_rear_kmph": float(VMG_vmg_DW_rear),
 
-        "routes": [route_A, route_B, route_Ap, route_Bp],
+        "routes": [r for r in (route_A, route_B, route_Ap, route_Bp) if r.get("visible", True)],
     }

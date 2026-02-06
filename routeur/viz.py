@@ -248,7 +248,7 @@ def build_deck(ctx, geom, PI_xy, out):
 # ============================
 
 def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dict):
-    """Pydeck rendering for the simplified router page. Supports multi routes via route_out['routes']."""
+    """Pydeck rendering for the simplified router page."""
     to_utm, to_wgs = ctx["to_utm"], ctx["to_wgs"]
     centroid_lat, centroid_lon = ctx["centroid_lat"], ctx["centroid_lon"]
 
@@ -300,19 +300,12 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
         {"path": [[wind_end_ll[1], wind_end_ll[0]], [ah2_ll[1], ah2_ll[0]]]},
     ]
 
-    # ------------------------
-    # Routes (single or multi)
-    # ------------------------
+    # Routes
     route_layers = []
-
-    routes = route_out.get("routes", None)
-    if routes is None:
-        routes = [route_out]
-
-    for r in routes:
+    for r in (route_out.get("routes") or []):
         path_ll = r.get("route_path_ll", None)
         if path_ll and len(path_ll) >= 2:
-            color = r.get("color", [0, 255, 0])
+            color = r.get("color", [255, 255, 255])
             route_layers.append(
                 pdk.Layer(
                     "PathLayer",
@@ -324,36 +317,48 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
                 )
             )
 
-    # Points: marks + target + gybes
-    marks_of_interest = ["SL1","SL2","M1","WG1","WG2","LG1","LG2","FL1","FL2"]
+    # Points: marks
+    marks_of_interest = ["SL1", "SL2", "M1", "WG1", "WG2", "LG1", "LG2", "FL1", "FL2"]
     pts = []
     for name in marks_of_interest:
         if name in marks_ll:
             lat, lon = marks_ll[name]
             pts.append({"name": name, "lat": float(lat), "lon": float(lon), "kind": "mark"})
 
-    # Target MLG
-    if route_out.get("target_MLG_ll") is not None:
-        lat, lon = route_out["target_MLG_ll"]
-        pts.append({"name": "MLG", "lat": float(lat), "lon": float(lon), "kind": "calc"})
-
-    # Gybe points for each route
-    for r in routes:
-        label = r.get("label", "")
-        for i, ll in enumerate(r.get("gybe_points_ll", []) or []):
-            lat, lon = ll
-            pts.append({"name": f"{label} G{i+1}".strip(), "lat": float(lat), "lon": float(lon), "kind": "calc"})
-
     # Labels
     label_e, label_n = 10.0, -14.0
     labels = []
-    for txt in ["SL1","SL2","M1","LG1","LG2","WG1","WG2"]:
+    for txt in ["SL1", "SL2", "M1", "LG1", "LG2", "WG1", "WG2"]:
         if txt in marks_ll:
             ll = marks_ll[txt]
             lat2, lon2 = label_offset_ll(to_utm, to_wgs, ll[0], ll[1], label_e, label_n)
             labels.append({"text": txt, "lat": lat2, "lon": lon2})
 
+    # Favorable marks (pink ring)
+    fav = []
+    lw_bias = float(route_out.get("LW_gate_bias_m", float("nan")))
+    ww_bias = float(route_out.get("WW_gate_bias_m", float("nan")))
+
+    # LW: LG1 if bias<-1, LG2 if bias>1
+    if np.isfinite(lw_bias):
+        if lw_bias < -1.0 and "LG1" in marks_ll:
+            lat, lon = marks_ll["LG1"]
+            fav.append({"name": "LW_fav", "lat": float(lat), "lon": float(lon)})
+        elif lw_bias > 1.0 and "LG2" in marks_ll:
+            lat, lon = marks_ll["LG2"]
+            fav.append({"name": "LW_fav", "lat": float(lat), "lon": float(lon)})
+
+    # WW: WG2 if bias<-1, WG1 if bias>1
+    if np.isfinite(ww_bias):
+        if ww_bias < -1.0 and "WG2" in marks_ll:
+            lat, lon = marks_ll["WG2"]
+            fav.append({"name": "WW_fav", "lat": float(lat), "lon": float(lon)})
+        elif ww_bias > 1.0 and "WG1" in marks_ll:
+            lat, lon = marks_ll["WG1"]
+            fav.append({"name": "WW_fav", "lat": float(lat), "lon": float(lon)})
+
     layers = []
+
     layers.append(
         pdk.Layer(
             "PathLayer",
@@ -378,6 +383,7 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
 
     layers.extend(route_layers)
 
+    # Wind
     layers.append(
         pdk.Layer(
             "PathLayer",
@@ -388,18 +394,21 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
             get_color=[0, 90, 255],
         )
     )
+
+    # ✅ TWD label: white, +20%, triple space, degree sign
     layers.append(
         pdk.Layer(
             "TextLayer",
-            data=[{"text": f"TWD {TWD:.0f}°", "lat": anchor_ll[0], "lon": anchor_ll[1]}],
+            data=[{"text": f"TWD   {TWD:.0f}°", "lat": anchor_ll[0], "lon": anchor_ll[1]}],
             get_position="[lon, lat]",
             get_text="text",
-            get_size=12,
+            get_size=15,
             get_alignment_baseline="'top'",
-            get_color=[0, 90, 255],
+            get_color=[255, 255, 255],
         )
     )
 
+    # Marks
     if pts:
         layers.append(
             pdk.Layer(
@@ -411,6 +420,22 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
                 get_fill_color="kind == 'mark' ? [255, 220, 0] : [255, 255, 255]",
                 get_line_color=[0, 0, 0],
                 line_width_min_pixels=1,
+            )
+        )
+
+    # ✅ Favorable pink rings (robust outline)
+    if fav:
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=pd.DataFrame(fav),
+                get_position="[lon, lat]",
+                get_radius=25,
+                stroked=True,
+                filled=False,
+                get_line_color=[255, 105, 180],
+                line_width_min_pixels=4,
+                pickable=False,
             )
         )
 
@@ -435,4 +460,5 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
         bearing=bearing,
     )
     return pdk.Deck(layers=layers, initial_view_state=view_state, tooltip={"text": "{name}"})
+
 

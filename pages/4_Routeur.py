@@ -19,5 +19,8 @@ deck, out = render_routeur_simplifie(
 
 if deck is not None:
     st.pydeck_chart(deck, width="stretch")
+    if out and out.get("results_html"):
+        st.markdown(out["results_html"], unsafe_allow_html=True)
+
 else:
     st.info("Charge un XML dans la sidebar pour afficher la carto et les résultats.")
