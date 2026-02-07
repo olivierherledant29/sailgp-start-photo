@@ -9,7 +9,13 @@ from shapely.affinity import rotate as shp_rotate
 
 from .geo import make_context_from_boundary, to_xy_marks_and_polys, marks_ll_to_xy, xy_to_ll
 from .polars import list_polar_files, load_polar_interpolator, polar_twa_candidates
-from .model import compute_first_dw_from_M1
+from .model import (
+    compute_gate_biases,
+    compute_route_group,
+    wrap180,
+    twa_from_twd_hdg,
+    bearing_deg_xy,
+)
 from .viz import build_deck_routeur
 
 
@@ -18,11 +24,6 @@ def _rot_xy_about(p_xy: np.ndarray, origin_xy: np.ndarray, ang_rad_ccw: float) -
     c, s = float(np.cos(ang_rad_ccw)), float(np.sin(ang_rad_ccw))
     vr = np.array([c * v[0] - s * v[1], s * v[0] + c * v[1]], dtype=float)
     return origin_xy + vr
-
-
-def _rot_vec(v_xy: np.ndarray, ang_rad_ccw: float) -> np.ndarray:
-    c, s = float(np.cos(ang_rad_ccw)), float(np.sin(ang_rad_ccw))
-    return np.array([c * v_xy[0] - s * v_xy[1], s * v_xy[0] + c * v_xy[1]], dtype=float)
 
 
 def _rotate_marks_xy(marks_xy: dict, origin_xy: np.ndarray, ang_rad_ccw: float) -> dict:
@@ -58,12 +59,45 @@ def _cached_polar_interpolator(abs_path_str: str):
     return load_polar_interpolator(abs_path_str)
 
 
-ROUTE_COLORS = {
-    "A":  [0, 255, 0],
-    "B":  [255, 0, 255],
-    "A'": [255, 165, 0],
-    "B'": [0, 255, 255],
+# --- Colors
+GROUP_BASE_COLORS = {
+    "FIRST_DW_M1": [0, 255, 0],
+    "FULL_UW_LG2": [0, 200, 255],
+    "FULL_UW_LG1": [255, 180, 0],
+    "FULL_DW_WG2": [180, 0, 255],
+    "FULL_DW_WG1": [255, 80, 80],
 }
+TRAJ_SHADE = {"A": 1.00, "B": 0.85, "A'": 0.70, "B'": 0.55}
+
+
+def _color_for(group_id: str, traj: str) -> list[int]:
+    traj = str(traj).strip()
+
+    # First DW: couleurs franches demandées
+    if group_id == "FIRST_DW_M1":
+        return {
+            "A": [0, 255, 0],        # vert
+            "B": [255, 0, 0],        # rouge
+            "A'": [0, 200, 255],     # cyan
+            "B'": [255, 255, 0],     # jaune
+        }.get(traj, [255, 255, 255])
+
+    # autres groupes : base + shade
+    base = GROUP_BASE_COLORS.get(group_id, [255, 255, 255])
+    k = TRAJ_SHADE.get(traj, 1.0)
+    return [int(base[0] * k), int(base[1] * k), int(base[2] * k)]
+
+
+def _guess_twd_from_xml_filename() -> float:
+    name = st.session_state.get("boundary_xml_name", None)
+    if not isinstance(name, str) or len(name) < 3:
+        return 0.0
+    prefix = name.strip()[:3]
+    if prefix.isdigit():
+        x = float(int(prefix))
+        if 0.0 <= x <= 360.0:
+            return x
+    return 0.0
 
 
 def _gate_side_label(gate: str, bias_m: float) -> str:
@@ -84,62 +118,126 @@ def _gate_side_label(gate: str, bias_m: float) -> str:
     return "porte WW neutre"
 
 
-def _rgb_to_css(rgb: list[int]) -> str:
-    return f"rgb({int(rgb[0])},{int(rgb[1])},{int(rgb[2])})"
+# =========================================================
+# Sign logic for selecting A'/B' correctly
+# =========================================================
+def _twa_sign_of_segment(p0: np.ndarray, p1: np.ndarray, TWD_calc: float = 180.0) -> int:
+    hdg = bearing_deg_xy((float(p0[0]), float(p0[1])), (float(p1[0]), float(p1[1])))
+    twa = wrap180(twa_from_twd_hdg(float(TWD_calc), float(hdg)))
+    if twa > 1e-6:
+        return +1
+    if twa < -1e-6:
+        return -1
+    return 0
 
 
-def _build_results_html(routes: list[dict]) -> str:
-    rows = []
+def _twa_sign_first_segment_forward(path_xy: list, TWD_calc: float = 180.0) -> int:
+    """First segment (start -> next) for forward routes (A/B)."""
+    if not path_xy or len(path_xy) < 2:
+        return 0
+    p0 = np.array(path_xy[0], dtype=float)
+    p1 = np.array(path_xy[1], dtype=float)
+    return _twa_sign_of_segment(p0, p1, TWD_calc=TWD_calc)
+
+
+def _twa_sign_depart_from_rear(path_xy: list, TWD_calc: float = 180.0) -> int:
+    """
+    For rear routes (A'/B') stored as dest -> start:
+    departure segment must be start -> previous point (outgoing):
+      p[-1] (start) -> p[-2]
+    """
+    if not path_xy or len(path_xy) < 2:
+        return 0
+    p_start = np.array(path_xy[-1], dtype=float)
+    p_prev = np.array(path_xy[-2], dtype=float)
+    return _twa_sign_of_segment(p_start, p_prev, TWD_calc=TWD_calc)
+
+
+def _filter_group_routes_full_uw(routes: list[dict]) -> list[dict]:
+    """
+    FULL UW (inchangé) :
+      - keep A, B
+      - keep A'/B' only if sign(TWA at departure) == sign(A forward first segment)
+    """
+    sign_A = 0
     for r in routes:
-        name = r.get("traj_name") or r.get("traj", "?")
-        color = r.get("color", [255, 255, 255])
-        c = _rgb_to_css(color)
-        rows.append(
-            "<tr>"
-            f"<td style='padding:4px 8px;'><span style='display:inline-block;width:10px;height:10px;border-radius:50%;background:{c};border:1px solid #111;'></span></td>"
-            f"<td style='padding:4px 8px;font-weight:700;color:{c};'>{name}</td>"
-            f"<td style='padding:4px 8px;text-align:right;'>{float(r.get('time_total_s', float('nan'))):.0f}</td>"
-            f"<td style='padding:4px 8px;text-align:right;'>{float(r.get('dist_total_m', float('nan'))):.0f}</td>"
-            f"<td style='padding:4px 8px;text-align:right;'>{int(r.get('n_gybes', 0))}</td>"
-            f"<td style='padding:4px 8px;text-align:right;'>{float(r.get('TWA_to_dest_start_deg', float('nan'))):.0f}</td>"
-            "</tr>"
-        )
+        traj = str(r.get("traj", r.get("label", ""))).strip()
+        if traj == "A":
+            sign_A = _twa_sign_first_segment_forward(r.get("route_path_xy", []), TWD_calc=180.0)
+            break
 
-    return f"""
-    <div style="font-size: 13px;">
-      <table style="width:100%; border-collapse: collapse;">
-        <thead>
-          <tr>
-            <th style="text-align:left; border-bottom:1px solid #666; width:24px;"></th>
-            <th style="text-align:left; border-bottom:1px solid #666;">traj</th>
-            <th style="text-align:right; border-bottom:1px solid #666;">time (s)</th>
-            <th style="text-align:right; border-bottom:1px solid #666;">dist (m)</th>
-            <th style="text-align:right; border-bottom:1px solid #666;">gybes</th>
-            <th style="text-align:right; border-bottom:1px solid #666;">TWA_start (°)</th>
-          </tr>
-        </thead>
-        <tbody>
-          {''.join(rows)}
-        </tbody>
-      </table>
-    </div>
-    """
+    out = []
+    for r in routes:
+        traj = str(r.get("traj", r.get("label", ""))).strip()
+        if traj in ("A", "B"):
+            out.append(r)
+            continue
+        if traj in ("A'", "B'"):
+            s = _twa_sign_depart_from_rear(r.get("route_path_xy", []), TWD_calc=180.0)
+            if s == sign_A:
+                out.append(r)
+            continue
+        out.append(r)
+    return out
 
 
-def _guess_twd_from_xml_filename() -> float:
+def _filter_group_routes_full_dw(routes: list[dict]) -> list[dict]:
     """
-    TWD_base par défaut = 0 ou 3 premiers chars du nom du XML (si digits) stocké dans boundary_shared.
-    Ex: "260116_132758R3A 260 .75_race" -> 260
+    FULL DW (corrigé):
+      - remove B
+      - keep A
+      - keep EXACTLY ONE of A'/B' (never 0, never 2):
+          prefer the one with matching sign to A;
+          if both match -> keep faster;
+          if none match -> keep faster.
     """
-    name = st.session_state.get("boundary_xml_name", None)
-    if not isinstance(name, str) or len(name) < 3:
-        return 0.0
-    prefix = name.strip()[:3]
-    if prefix.isdigit():
-        x = float(int(prefix))
-        if 0.0 <= x <= 360.0:
-            return x
-    return 0.0
+    # sign of A (forward)
+    sign_A = 0
+    route_A = None
+    for r in routes:
+        traj = str(r.get("traj", r.get("label", ""))).strip()
+        if traj == "A":
+            route_A = r
+            sign_A = _twa_sign_first_segment_forward(r.get("route_path_xy", []), TWD_calc=180.0)
+            break
+
+    # collect primes
+    prime_routes = []
+    for r in routes:
+        traj = str(r.get("traj", r.get("label", ""))).strip()
+        if traj in ("A'", "B'"):
+            s = _twa_sign_depart_from_rear(r.get("route_path_xy", []), TWD_calc=180.0)
+            prime_routes.append((r, s))
+
+    # decide which prime to keep
+    chosen_prime = None
+    if prime_routes:
+        matching = [r for (r, s) in prime_routes if s == sign_A]
+        if len(matching) == 1:
+            chosen_prime = matching[0]
+        elif len(matching) >= 2:
+            chosen_prime = min(matching, key=lambda rr: float(rr.get("time_total_s", 1e18)))
+        else:
+            # none match -> keep fastest anyway
+            chosen_prime = min([r for (r, _) in prime_routes], key=lambda rr: float(rr.get("time_total_s", 1e18)))
+
+    out = []
+    for r in routes:
+        traj = str(r.get("traj", r.get("label", ""))).strip()
+
+        if traj == "B":
+            continue
+        if traj == "A":
+            out.append(r)
+            continue
+        if traj in ("A'", "B'"):
+            if chosen_prime is not None and r is chosen_prime:
+                out.append(r)
+            continue
+
+        out.append(r)
+
+    return out
 
 
 def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
@@ -159,9 +257,10 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
     marks_of_interest = ["SL1", "SL2", "M1", "WG1", "WG2", "LG1", "LG2", "FL1", "FL2"]
     marks_ll = {k: marks_ll_all[k] for k in marks_of_interest if k in marks_ll_all}
 
-    missing = [m for m in ["M1", "LG1", "LG2"] if m not in marks_ll]
+    required = ["M1", "LG1", "LG2", "WG1", "WG2"]
+    missing = [m for m in required if m not in marks_ll]
     if missing:
-        st.error(f"Marques manquantes dans le XML: {', '.join(missing)} (requises pour 'first DW').")
+        st.error(f"Marques manquantes dans le XML: {', '.join(missing)}")
         return None, None
 
     # Sidebar: offset only
@@ -175,12 +274,10 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
         )
         st.session_state["offset_TWD"] = int(offset_TWD)
 
-    # Widgets (integers)
-    c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.6, 1.1, 1.1])
-
+    # Widgets top row (no gybe widget)
+    c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.6, 1.1])
     with c1:
         TWS_ref_kmh = st.number_input("TWS (km/h)", min_value=1, max_value=50, value=20, step=1, format="%d")
-
     with c2:
         if "TWD_base" not in st.session_state:
             st.session_state["TWD_base"] = float(_guess_twd_from_xml_filename())
@@ -206,16 +303,14 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
     with c4:
         size_buffer_BDY = st.number_input("Buffer boundary (m)", min_value=0, max_value=500, value=20, step=1, format="%d")
 
-    with c5:
-        gybe_loss_s = st.number_input("Perte gybe (s)", min_value=0, max_value=30, value=5, step=1, format="%d")
-
-    c6, c7, c8 = st.columns([1.1, 1.0, 2.9])
+    c6, c7 = st.columns([1.1, 3.9])
     with c6:
         d_rounding_mark = st.number_input("d_rounding_mark (m)", min_value=0, max_value=50, value=10, step=1, format="%d")
     with c7:
-        debug = st.checkbox("Debug (events)", value=False)
-    with c8:
         st.markdown(f"**TWD_base={int(TWD_base)}°** — **offset_TWD={int(offset_TWD):+d}°** — **TWD appliqué={int(TWD)}°**")
+
+    # Gybe loss fixed to 3s
+    gybe_loss_s = 3.0
 
     # World geometry
     ctx = make_context_from_boundary(boundary_latlon)
@@ -223,7 +318,7 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
     geom = to_xy_marks_and_polys(ctx, marks_for_geom, boundary_latlon, float(size_buffer_BDY))
     marks_xy_world = marks_ll_to_xy(ctx, marks_ll)
 
-    # Wind-up rotation CW=(TWD-180)
+    # Rotate into calc frame (wind from top => TWD_calc=180)
     angle_deg_cw = (float(TWD) - 180.0) % 360.0
     angle_rad_ccw = np.deg2rad(angle_deg_cw)
 
@@ -234,89 +329,157 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
     geom_rot["poly_BDY"] = shp_rotate(geom["poly_BDY"], float(np.rad2deg(angle_rad_ccw)), origin=(origin_xy[0], origin_xy[1]))
     geom_rot["poly_buffer"] = shp_rotate(geom["poly_buffer"], float(np.rad2deg(angle_rad_ccw)), origin=(origin_xy[0], origin_xy[1])) if geom.get("poly_buffer") is not None else None
 
-    # M1 rounding: if currently on right, we invert by using +left_world (not -)
-    if "M1" in marks_xy_world:
-        left_wind = np.array([-1.0, 0.0], dtype=float)
-        left_world = -1 * _rot_vec(left_wind, -angle_rad_ccw)
-        # ✅ left_world (no extra inversion here). If it still goes right, flip here.
-        M1_round_world = np.array(marks_xy_world["M1"], dtype=float) + float(d_rounding_mark) * left_world
-        M1_round_rot = _rot_xy_about(M1_round_world, origin_xy, angle_rad_ccw)
-        marks_xy_rot["M1"] = M1_round_rot
+    LG1 = marks_xy_rot["LG1"]
+    LG2 = marks_xy_rot["LG2"]
+    WG1 = marks_xy_rot["WG1"]
+    WG2 = marks_xy_rot["WG2"]
+    M1 = marks_xy_rot["M1"]
+
+    MLG = 0.5 * (LG1 + LG2)
+    MWG = 0.5 * (WG1 + WG2)
+
+    LEFT = np.array([+1.0, 0.0], dtype=float)
+    RIGHT = np.array([-1.0, 0.0], dtype=float)
+
+    M1_round = M1 + float(d_rounding_mark) * LEFT
+    LG2_left = LG2 + float(d_rounding_mark) * LEFT
+    LG1_right = LG1 + float(d_rounding_mark) * RIGHT
+    WG2_left = WG2 + float(d_rounding_mark) * LEFT
+    WG1_right = WG1 + float(d_rounding_mark) * RIGHT
 
     twa_cands = polar_twa_candidates(polar_interp)
+    biases = compute_gate_biases(marks_xy_rot, 180.0)
 
-    out = compute_first_dw_from_M1(
+    # --- Groups
+    g_first_dw = compute_route_group(
+        group_id="FIRST_DW_M1",
+        start_xy=M1_round,
+        dest_xy=MLG,
         ctx=ctx,
         geom=geom_rot,
-        marks_xy=marks_xy_rot,
         TWD=180.0,
         TWS_ref_kmh=float(TWS_ref_kmh),
         polar_bsp_kmh=polar_interp,
         twa_candidates_deg=twa_cands,
         gybe_loss_s=float(gybe_loss_s),
+        leg_type="DW",
+        A_twa_sign=+1,
     )
 
-    routes = out.get("routes", [])
-    if not routes:
-        st.error("Aucune trajectoire renvoyée par le modèle.")
-        return None, None
-
-    # de-rotate for display + colors
-    for r in routes:
-        traj = r.get("traj", r.get("label", "?"))
-        r["traj"] = traj
-        r["color"] = ROUTE_COLORS.get(traj, [255, 255, 255])
-
-        path_xy_rot = [np.array(p, dtype=float) for p in r.get("route_path_xy", [])]
-        path_xy_world = [_rot_xy_about(p, origin_xy, -angle_rad_ccw) for p in path_xy_rot]
-        r["route_path_ll"] = []
-        for p in path_xy_world:
-            lat, lon = xy_to_ll(ctx["to_wgs"], float(p[0]), float(p[1]))
-            r["route_path_ll"].append([lon, lat])
-
-        gy_xy_rot = [np.array(p, dtype=float) for p in (r.get("gybe_points_xy", []) or [])]
-        gy_xy_world = [_rot_xy_about(p, origin_xy, -angle_rad_ccw) for p in gy_xy_rot]
-        r["gybe_points_ll"] = []
-        for p in gy_xy_world:
-            lat, lon = xy_to_ll(ctx["to_wgs"], float(p[0]), float(p[1]))
-            r["gybe_points_ll"].append((lat, lon))
-
-    out["TWD"] = float(TWD)
-    out["TWD_base"] = float(TWD_base)
-    out["offset_TWD"] = float(offset_TWD)
-    out["routes"] = routes
-    out["results_html"] = _build_results_html(routes)
-
-    # Lines above map
-    st.markdown(f"**Rappel TWD** — base={int(TWD_base)}° ; offset={int(offset_TWD):+d}° ; appliqué={int(TWD)}°")
-    st.markdown(
-        f"**VMG DW**: TWA={out['TWA_vmg_DW_deg']:.0f}° — BSP={out['BSP_vmg_DW_kmph']:.1f} km/h — VMG={out['VMG_vmg_DW_kmph']:.1f} km/h  \n"
-        f"**VMG UW**: TWA={out['TWA_vmg_UW_deg']:.0f}° — BSP={out['BSP_vmg_UW_kmph']:.1f} km/h — VMG={out['VMG_vmg_UW_kmph']:.1f} km/h"
+    g_uw_lg2 = compute_route_group(
+        group_id="FULL_UW_LG2",
+        start_xy=LG2_left,
+        dest_xy=MWG,
+        ctx=ctx,
+        geom=geom_rot,
+        TWD=180.0,
+        TWS_ref_kmh=float(TWS_ref_kmh),
+        polar_bsp_kmh=polar_interp,
+        twa_candidates_deg=twa_cands,
+        gybe_loss_s=float(gybe_loss_s),
+        leg_type="UW",
+        A_twa_sign=+1,
+    )
+    g_uw_lg1 = compute_route_group(
+        group_id="FULL_UW_LG1",
+        start_xy=LG1_right,
+        dest_xy=MWG,
+        ctx=ctx,
+        geom=geom_rot,
+        TWD=180.0,
+        TWS_ref_kmh=float(TWS_ref_kmh),
+        polar_bsp_kmh=polar_interp,
+        twa_candidates_deg=twa_cands,
+        gybe_loss_s=float(gybe_loss_s),
+        leg_type="UW",
+        A_twa_sign=-1,
     )
 
-    lw_bias = float(out.get("LW_gate_bias_m", float("nan")))
-    ww_bias = float(out.get("WW_gate_bias_m", float("nan")))
+    g_dw_wg2 = compute_route_group(
+        group_id="FULL_DW_WG2",
+        start_xy=WG2_left,
+        dest_xy=MLG,
+        ctx=ctx,
+        geom=geom_rot,
+        TWD=180.0,
+        TWS_ref_kmh=float(TWS_ref_kmh),
+        polar_bsp_kmh=polar_interp,
+        twa_candidates_deg=twa_cands,
+        gybe_loss_s=float(gybe_loss_s),
+        leg_type="DW",
+        A_twa_sign=+1,
+    )
+    g_dw_wg1 = compute_route_group(
+        group_id="FULL_DW_WG1",
+        start_xy=WG1_right,
+        dest_xy=MLG,
+        ctx=ctx,
+        geom=geom_rot,
+        TWD=180.0,
+        TWS_ref_kmh=float(TWS_ref_kmh),
+        polar_bsp_kmh=polar_interp,
+        twa_candidates_deg=twa_cands,
+        gybe_loss_s=float(gybe_loss_s),
+        leg_type="DW",
+        A_twa_sign=-1,
+    )
+
+    # Apply filtering
+    g_uw_lg2["routes"] = _filter_group_routes_full_uw(g_uw_lg2["routes"])   # UW unchanged
+    g_uw_lg1["routes"] = _filter_group_routes_full_uw(g_uw_lg1["routes"])   # UW unchanged
+    g_dw_wg2["routes"] = _filter_group_routes_full_dw(g_dw_wg2["routes"])   # DW: keep one prime
+    g_dw_wg1["routes"] = _filter_group_routes_full_dw(g_dw_wg1["routes"])   # DW: keep one prime
+
+    # =============================
+    # Convert routes to WORLD LL for viz + colors
+    # =============================
+    def _routes_to_world(group_out: dict) -> list[dict]:
+        routes = group_out.get("routes", [])
+        for r in routes:
+            traj = str(r.get("traj", r.get("label", "?"))).strip()
+            gid = str(r.get("group_id", group_out.get("group_id", "")))
+            r["traj"] = traj
+            r["color"] = _color_for(gid, traj)
+
+            path_xy_rot = [np.array(p, dtype=float) for p in r.get("route_path_xy", [])]
+            path_xy_world = [_rot_xy_about(p, origin_xy, -angle_rad_ccw) for p in path_xy_rot]
+            r["route_path_ll"] = []
+            for p in path_xy_world:
+                lat, lon = xy_to_ll(ctx["to_wgs"], float(p[0]), float(p[1]))
+                r["route_path_ll"].append([lon, lat])
+        return routes
+
+    routes_1 = _routes_to_world(g_first_dw)
+    routes_2 = _routes_to_world(g_uw_lg2) + _routes_to_world(g_uw_lg1)
+    routes_3 = _routes_to_world(g_dw_wg2) + _routes_to_world(g_dw_wg1)
+
+    # Final safety: ensure B never appears in FULL DW
+    routes_3 = [r for r in routes_3 if str(r.get("traj", "")).strip() != "B"]
+
+    # VMG info per card
+    vmg1 = [{"group": g_first_dw["group_id"], "leg": g_first_dw["leg_type"], "TWA": g_first_dw["TWA_vmg_abs_deg"], "BSP": g_first_dw["BSP_vmg_kmph"]}]
+    vmg2 = [
+        {"group": g_uw_lg2["group_id"], "leg": g_uw_lg2["leg_type"], "TWA": g_uw_lg2["TWA_vmg_abs_deg"], "BSP": g_uw_lg2["BSP_vmg_kmph"]},
+        {"group": g_uw_lg1["group_id"], "leg": g_uw_lg1["leg_type"], "TWA": g_uw_lg1["TWA_vmg_abs_deg"], "BSP": g_uw_lg1["BSP_vmg_kmph"]},
+    ]
+    vmg3 = [
+        {"group": g_dw_wg2["group_id"], "leg": g_dw_wg2["leg_type"], "TWA": g_dw_wg2["TWA_vmg_abs_deg"], "BSP": g_dw_wg2["BSP_vmg_kmph"]},
+        {"group": g_dw_wg1["group_id"], "leg": g_dw_wg1["leg_type"], "TWA": g_dw_wg1["TWA_vmg_abs_deg"], "BSP": g_dw_wg1["BSP_vmg_kmph"]},
+    ]
+
+    out1 = {**biases, "TWD": float(TWD), "routes": routes_1, "vmg_info": vmg1}
+    out2 = {**biases, "TWD": float(TWD), "routes": routes_2, "vmg_info": vmg2}
+    out3 = {**biases, "TWD": float(TWD), "routes": routes_3, "vmg_info": vmg3}
+
+    lw_bias = float(biases.get("LW_gate_bias_m", float("nan")))
+    ww_bias = float(biases.get("WW_gate_bias_m", float("nan")))
     st.markdown(
         f"**LW gate bias**: {lw_bias:.1f} m — *{_gate_side_label('LW', lw_bias)}*  \n"
         f"**WW gate bias**: {ww_bias:.1f} m — *{_gate_side_label('WW', ww_bias)}*"
     )
 
-    deck = build_deck_routeur(
-        ctx=ctx,
-        geom=geom,
-        marks_ll=marks_ll,
-        marks_xy=marks_xy_world,
-        route_out=out,
-    )
+    deck1 = build_deck_routeur(ctx=ctx, geom=geom, marks_ll=marks_ll, marks_xy=marks_xy_world, route_out=out1)
+    deck2 = build_deck_routeur(ctx=ctx, geom=geom, marks_ll=marks_ll, marks_xy=marks_xy_world, route_out=out2)
+    deck3 = build_deck_routeur(ctx=ctx, geom=geom, marks_ll=marks_ll, marks_xy=marks_xy_world, route_out=out3)
 
-    if debug:
-        ev_rows = []
-        for r in routes:
-            for e in (r.get("events", []) or []):
-                ee = dict(e)
-                ee["traj"] = r.get("traj_name") or r.get("traj", "?")
-                ev_rows.append(ee)
-        if ev_rows:
-            st.dataframe(pd.DataFrame(ev_rows), width="stretch", hide_index=True)
-
-    return deck, out
+    return {"deck1": deck1, "deck2": deck2, "deck3": deck3}, {"out1": out1, "out2": out2, "out3": out3}
