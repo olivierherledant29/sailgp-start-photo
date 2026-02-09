@@ -243,6 +243,7 @@ def build_deck(ctx, geom, PI_xy, out):
 
     return pdk.Deck(layers=layers, initial_view_state=view_state, tooltip={"text": "{name}"})
 
+
 # ============================
 # Routeur simplifié (SailGP) – map rendering
 # ============================
@@ -339,7 +340,6 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
     lw_bias = float(route_out.get("LW_gate_bias_m", float("nan")))
     ww_bias = float(route_out.get("WW_gate_bias_m", float("nan")))
 
-    # LW: LG1 if bias<-1, LG2 if bias>1
     if np.isfinite(lw_bias):
         if lw_bias < -1.0 and "LG1" in marks_ll:
             lat, lon = marks_ll["LG1"]
@@ -348,7 +348,6 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
             lat, lon = marks_ll["LG2"]
             fav.append({"name": "LW_fav", "lat": float(lat), "lon": float(lon)})
 
-    # WW: WG2 if bias<-1, WG1 if bias>1
     if np.isfinite(ww_bias):
         if ww_bias < -1.0 and "WG2" in marks_ll:
             lat, lon = marks_ll["WG2"]
@@ -356,6 +355,12 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
         elif ww_bias > 1.0 and "WG1" in marks_ll:
             lat, lon = marks_ll["WG1"]
             fav.append({"name": "WW_fav", "lat": float(lat), "lon": float(lon)})
+
+    # ✅ Start-line overlay (points + arrows)
+    overlay = route_out.get("startline_overlay") if isinstance(route_out, dict) else None
+    overlay_points = overlay.get("SL_points", []) if overlay else []
+    overlay_arrow_paths = overlay.get("SL_arrow_paths", []) if overlay else []  # NEW
+    overlay_vectors = overlay.get("SL_vectors", []) if overlay else []         # compat
 
     layers = []
 
@@ -383,6 +388,48 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
 
     layers.extend(route_layers)
 
+    # ✅ Prefer arrow paths (shaft+head). If absent, fallback to vectors.
+    if overlay_arrow_paths:
+        layers.append(
+            pdk.Layer(
+                "PathLayer",
+                data=overlay_arrow_paths,
+                get_path="path",
+                width_scale=8,
+                width_min_pixels=3,
+                get_color=[200, 90, 0],  # dark orange
+                pickable=False,
+            )
+        )
+    elif overlay_vectors:
+        layers.append(
+            pdk.Layer(
+                "LineLayer",
+                data=overlay_vectors,
+                get_source_position=["lon0", "lat0"],
+                get_target_position=["lon1", "lat1"],
+                get_color=[200, 90, 0],
+                get_width=3,
+                width_units="pixels",
+                pickable=True,
+            )
+        )
+
+    if overlay_points:
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=overlay_points,
+                get_position=["lon", "lat"],
+                get_radius=3.0,
+                radius_units="meters",
+                get_fill_color=[255, 255, 255],
+                get_line_color=[0, 0, 0],
+                line_width_min_pixels=1,
+                pickable=True,
+            )
+        )
+
     # Wind
     layers.append(
         pdk.Layer(
@@ -395,7 +442,7 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
         )
     )
 
-    # ✅ TWD label: white, +20%, triple space, degree sign
+    # ✅ TWD label: white, bigger, triple space, degree sign
     layers.append(
         pdk.Layer(
             "TextLayer",
@@ -408,7 +455,6 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
         )
     )
 
-    # Marks
     if pts:
         layers.append(
             pdk.Layer(
@@ -423,7 +469,6 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
             )
         )
 
-    # ✅ Favorable pink rings (robust outline)
     if fav:
         layers.append(
             pdk.Layer(
@@ -460,5 +505,3 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
         bearing=bearing,
     )
     return pdk.Deck(layers=layers, initial_view_state=view_state, tooltip={"text": "{name}"})
-
-

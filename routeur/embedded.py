@@ -41,7 +41,6 @@ def marks_df_to_marks_ll(marks_df: pd.DataFrame):
     out = {}
     if marks_df is None or marks_df.empty:
         return out
-
     df = marks_df.dropna(subset=["mark", "lat", "lon"]).copy()
     for _, r in df.iterrows():
         mark = str(r["mark"])
@@ -72,8 +71,6 @@ TRAJ_SHADE = {"A": 1.00, "B": 0.85, "A'": 0.70, "B'": 0.55}
 
 def _color_for(group_id: str, traj: str) -> list[int]:
     traj = str(traj).strip()
-
-    # First DW: couleurs franches demandées
     if group_id == "FIRST_DW_M1":
         return {
             "A": [0, 255, 0],        # vert
@@ -82,7 +79,6 @@ def _color_for(group_id: str, traj: str) -> list[int]:
             "B'": [255, 255, 0],     # jaune
         }.get(traj, [255, 255, 255])
 
-    # autres groupes : base + shade
     base = GROUP_BASE_COLORS.get(group_id, [255, 255, 255])
     k = TRAJ_SHADE.get(traj, 1.0)
     return [int(base[0] * k), int(base[1] * k), int(base[2] * k)]
@@ -103,14 +99,12 @@ def _guess_twd_from_xml_filename() -> float:
 def _gate_side_label(gate: str, bias_m: float) -> str:
     if not np.isfinite(bias_m):
         return f"porte {gate} ?"
-
     if gate == "LW":
         if bias_m < -1.0:
             return "L gauche en descendant"
         if bias_m > 1.0:
             return "R droite en descendant"
         return "porte LW neutre"
-
     if bias_m < -1.0:
         return "L gauche"
     if bias_m > 1.0:
@@ -119,125 +113,22 @@ def _gate_side_label(gate: str, bias_m: float) -> str:
 
 
 # =========================================================
-# Sign logic for selecting A'/B' correctly
+# Start-line overlay helpers
 # =========================================================
-def _twa_sign_of_segment(p0: np.ndarray, p1: np.ndarray, TWD_calc: float = 180.0) -> int:
-    hdg = bearing_deg_xy((float(p0[0]), float(p0[1])), (float(p1[0]), float(p1[1])))
-    twa = wrap180(twa_from_twd_hdg(float(TWD_calc), float(hdg)))
-    if twa > 1e-6:
-        return +1
-    if twa < -1e-6:
-        return -1
-    return 0
+def _unit(v: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    if n < 1e-9:
+        return np.array([0.0, 0.0], dtype=float)
+    return v / n
 
 
-def _twa_sign_first_segment_forward(path_xy: list, TWD_calc: float = 180.0) -> int:
-    """First segment (start -> next) for forward routes (A/B)."""
-    if not path_xy or len(path_xy) < 2:
-        return 0
-    p0 = np.array(path_xy[0], dtype=float)
-    p1 = np.array(path_xy[1], dtype=float)
-    return _twa_sign_of_segment(p0, p1, TWD_calc=TWD_calc)
+def _point_along(a: np.ndarray, b: np.ndarray, dist_from_a: float) -> np.ndarray:
+    u = _unit(b - a)
+    return a + float(dist_from_a) * u
 
 
-def _twa_sign_depart_from_rear(path_xy: list, TWD_calc: float = 180.0) -> int:
-    """
-    For rear routes (A'/B') stored as dest -> start:
-    departure segment must be start -> previous point (outgoing):
-      p[-1] (start) -> p[-2]
-    """
-    if not path_xy or len(path_xy) < 2:
-        return 0
-    p_start = np.array(path_xy[-1], dtype=float)
-    p_prev = np.array(path_xy[-2], dtype=float)
-    return _twa_sign_of_segment(p_start, p_prev, TWD_calc=TWD_calc)
-
-
-def _filter_group_routes_full_uw(routes: list[dict]) -> list[dict]:
-    """
-    FULL UW (inchangé) :
-      - keep A, B
-      - keep A'/B' only if sign(TWA at departure) == sign(A forward first segment)
-    """
-    sign_A = 0
-    for r in routes:
-        traj = str(r.get("traj", r.get("label", ""))).strip()
-        if traj == "A":
-            sign_A = _twa_sign_first_segment_forward(r.get("route_path_xy", []), TWD_calc=180.0)
-            break
-
-    out = []
-    for r in routes:
-        traj = str(r.get("traj", r.get("label", ""))).strip()
-        if traj in ("A", "B"):
-            out.append(r)
-            continue
-        if traj in ("A'", "B'"):
-            s = _twa_sign_depart_from_rear(r.get("route_path_xy", []), TWD_calc=180.0)
-            if s == sign_A:
-                out.append(r)
-            continue
-        out.append(r)
-    return out
-
-
-def _filter_group_routes_full_dw(routes: list[dict]) -> list[dict]:
-    """
-    FULL DW (corrigé):
-      - remove B
-      - keep A
-      - keep EXACTLY ONE of A'/B' (never 0, never 2):
-          prefer the one with matching sign to A;
-          if both match -> keep faster;
-          if none match -> keep faster.
-    """
-    # sign of A (forward)
-    sign_A = 0
-    route_A = None
-    for r in routes:
-        traj = str(r.get("traj", r.get("label", ""))).strip()
-        if traj == "A":
-            route_A = r
-            sign_A = _twa_sign_first_segment_forward(r.get("route_path_xy", []), TWD_calc=180.0)
-            break
-
-    # collect primes
-    prime_routes = []
-    for r in routes:
-        traj = str(r.get("traj", r.get("label", ""))).strip()
-        if traj in ("A'", "B'"):
-            s = _twa_sign_depart_from_rear(r.get("route_path_xy", []), TWD_calc=180.0)
-            prime_routes.append((r, s))
-
-    # decide which prime to keep
-    chosen_prime = None
-    if prime_routes:
-        matching = [r for (r, s) in prime_routes if s == sign_A]
-        if len(matching) == 1:
-            chosen_prime = matching[0]
-        elif len(matching) >= 2:
-            chosen_prime = min(matching, key=lambda rr: float(rr.get("time_total_s", 1e18)))
-        else:
-            # none match -> keep fastest anyway
-            chosen_prime = min([r for (r, _) in prime_routes], key=lambda rr: float(rr.get("time_total_s", 1e18)))
-
-    out = []
-    for r in routes:
-        traj = str(r.get("traj", r.get("label", ""))).strip()
-
-        if traj == "B":
-            continue
-        if traj == "A":
-            out.append(r)
-            continue
-        if traj in ("A'", "B'"):
-            if chosen_prime is not None and r is chosen_prime:
-                out.append(r)
-            continue
-
-        out.append(r)
-
-    return out
+def _kmph_to_mps(v_kmph: float) -> float:
+    return float(v_kmph) / 3.6
 
 
 def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
@@ -263,7 +154,7 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
         st.error(f"Marques manquantes dans le XML: {', '.join(missing)}")
         return None, None
 
-    # Sidebar: offset only
+    # Sidebar: offsets only
     with st.sidebar:
         offset_TWD = st.slider(
             "offset_TWD (°)",
@@ -274,17 +165,43 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
         )
         st.session_state["offset_TWD"] = int(offset_TWD)
 
-    # Widgets top row (no gybe widget)
+        # ✅ NEW: offset_TWS (km/h) in [-10,+10], but clamp min so TWS doesn't go below 0
+        # We'll set actual slider min later once we know TWS_base; keep placeholder in session for now.
+        if "offset_TWS" not in st.session_state:
+            st.session_state["offset_TWS"] = 0
+
+    # Widgets top row
     c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.6, 1.1])
     with c1:
-        TWS_ref_kmh = st.number_input("TWS (km/h)", min_value=1, max_value=50, value=20, step=1, format="%d")
+        # base only
+        TWS_base = st.number_input("TWS_base (km/h)", min_value=0, max_value=50, value=20, step=1, format="%d")
     with c2:
         if "TWD_base" not in st.session_state:
             st.session_state["TWD_base"] = float(_guess_twd_from_xml_filename())
-        TWD_base = st.number_input("TWD_base (°)", min_value=0, max_value=360, value=int(st.session_state["TWD_base"]), step=1, format="%d")
+        TWD_base = st.number_input(
+            "TWD_base (°)",
+            min_value=0,
+            max_value=360,
+            value=int(st.session_state["TWD_base"]),
+            step=1,
+            format="%d",
+        )
         st.session_state["TWD_base"] = float(TWD_base)
 
+    # now we can build the TWS offset slider with correct minimum
+    with st.sidebar:
+        min_off = int(max(-10, -int(TWS_base)))  # if TWS_base<10, min offset stops at -TWS_base
+        offset_TWS = st.slider(
+            "offset_TWS (km/h)",
+            min_value=min_off,
+            max_value=10,
+            value=int(st.session_state.get("offset_TWS", 0)),
+            step=1,
+        )
+        st.session_state["offset_TWS"] = int(offset_TWS)
+
     TWD = (float(TWD_base) + float(offset_TWD)) % 360.0
+    TWS_ref_kmh = float(max(0.0, float(TWS_base) + float(offset_TWS)))
 
     with c3:
         polars_dir = Path(__file__).resolve().parent / "polars"
@@ -307,14 +224,20 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
     with c6:
         d_rounding_mark = st.number_input("d_rounding_mark (m)", min_value=0, max_value=50, value=10, step=1, format="%d")
     with c7:
-        st.markdown(f"**TWD_base={int(TWD_base)}°** — **offset_TWD={int(offset_TWD):+d}°** — **TWD appliqué={int(TWD)}°**")
+        st.markdown(
+            f"**TWS_base={int(TWS_base)}** — **offset_TWS={int(offset_TWS):+d}** — **TWS appliqué={int(TWS_ref_kmh)}**  \n"
+            f"**TWD_base={int(TWD_base)}°** — **offset_TWD={int(offset_TWD):+d}°** — **TWD appliqué={int(TWD)}°**"
+        )
 
-    # Gybe loss fixed to 3s
     gybe_loss_s = 3.0
 
     # World geometry
     ctx = make_context_from_boundary(boundary_latlon)
-    marks_for_geom = {"SL1": marks_ll.get("SL1", marks_ll["M1"]), "SL2": marks_ll.get("SL2", marks_ll["M1"]), "M1": marks_ll["M1"]}
+    marks_for_geom = {
+        "SL1": marks_ll.get("SL1", marks_ll["M1"]),
+        "SL2": marks_ll.get("SL2", marks_ll["M1"]),
+        "M1": marks_ll["M1"],
+    }
     geom = to_xy_marks_and_polys(ctx, marks_for_geom, boundary_latlon, float(size_buffer_BDY))
     marks_xy_world = marks_ll_to_xy(ctx, marks_ll)
 
@@ -327,7 +250,11 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
 
     geom_rot = dict(geom)
     geom_rot["poly_BDY"] = shp_rotate(geom["poly_BDY"], float(np.rad2deg(angle_rad_ccw)), origin=(origin_xy[0], origin_xy[1]))
-    geom_rot["poly_buffer"] = shp_rotate(geom["poly_buffer"], float(np.rad2deg(angle_rad_ccw)), origin=(origin_xy[0], origin_xy[1])) if geom.get("poly_buffer") is not None else None
+    geom_rot["poly_buffer"] = (
+        shp_rotate(geom["poly_buffer"], float(np.rad2deg(angle_rad_ccw)), origin=(origin_xy[0], origin_xy[1]))
+        if geom.get("poly_buffer") is not None
+        else None
+    )
 
     LG1 = marks_xy_rot["LG1"]
     LG2 = marks_xy_rot["LG2"]
@@ -349,6 +276,99 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
 
     twa_cands = polar_twa_candidates(polar_interp)
     biases = compute_gate_biases(marks_xy_rot, 180.0)
+
+    # =========================================================
+    # Start-line overlay (First DW only): 11 points SL_0..SL_100
+    # VECTEURS SANS FLECHES
+    # Référence: segment le plus long (point le plus lent) => vecteur de longueur 0
+    # =========================================================
+    startline_overlay = None
+    if "SL1" in marks_xy_rot and "SL2" in marks_xy_rot:
+        SL1 = marks_xy_rot["SL1"]
+        SL2 = marks_xy_rot["SL2"]
+
+        SL1_7m = _point_along(SL1, SL2, 7.0)
+        SL2_7m = _point_along(SL2, SL1, 7.0)
+
+        rows = []
+        for i in range(11):  # 0..100%
+            t = i / 10.0
+            p = SL2_7m + t * (SL1_7m - SL2_7m)
+            x_pct = i * 10
+
+            v = M1 - p
+            dist_m = float(np.linalg.norm(v))
+            hdg = bearing_deg_xy((float(p[0]), float(p[1])), (float(M1[0]), float(M1[1])))
+            twa = wrap180(twa_from_twd_hdg(180.0, hdg))
+
+            bsp_kmph = float(polar_interp(float(TWS_ref_kmh), float(abs(twa))))
+            bsp_mps = _kmph_to_mps(bsp_kmph)
+            time_s = dist_m / bsp_mps if bsp_mps > 1e-9 else float("inf")
+
+            rows.append(
+                dict(
+                    x_pct=int(x_pct),
+                    p_xy=p,
+                    hdg_deg=float(hdg),
+                    twa_deg=float(twa),
+                    dist_m=float(dist_m),
+                    bsp_kmph=float(bsp_kmph),
+                    time_s=float(time_s),
+                )
+            )
+
+        # ✅ Référence = temps le plus long (point le plus lent)
+        Tmax = max(r["time_s"] for r in rows if np.isfinite(r["time_s"]))
+
+        pts_ll = []
+        arrow_paths_ll = []   # PathLayer segments (just shaft)
+        vectors_ll = []       # LineLayer compat (shaft)
+
+        for r in rows:
+            # ✅ dt = 0 pour le plus lent => vecteur 0
+            dt = float(Tmax - r["time_s"])
+            dd = _kmph_to_mps(r["bsp_kmph"]) * dt
+
+            u_to_M1 = _unit(M1 - r["p_xy"])
+            end_xy = r["p_xy"] + dd * u_to_M1
+
+            # point itself (always)
+            p_xy_world = _rot_xy_about(np.array(r["p_xy"], dtype=float), origin_xy, -angle_rad_ccw)
+            plat, plon = xy_to_ll(ctx["to_wgs"], float(p_xy_world[0]), float(p_xy_world[1]))
+            pts_ll.append(
+                dict(
+                    name=f"SL_{r['x_pct']}%",
+                    lon=float(plon),
+                    lat=float(plat),
+                    time_s=float(r["time_s"]),
+                    dt_s=float(dt),
+                    dd_m=float(dd),
+                    bsp_kmph=float(r["bsp_kmph"]),
+                    twa_deg=float(r["twa_deg"]),
+                    hdg_deg=float(r["hdg_deg"]),
+                    dist_m=float(r["dist_m"]),
+                )
+            )
+
+            # segment (skip if too small)
+            if dd < 1e-6:
+                continue
+
+            # build one shaft segment in WORLD LL
+            a_w = _rot_xy_about(np.array(r["p_xy"], dtype=float), origin_xy, -angle_rad_ccw)
+            b_w = _rot_xy_about(np.array(end_xy, dtype=float), origin_xy, -angle_rad_ccw)
+            alat, alon = xy_to_ll(ctx["to_wgs"], float(a_w[0]), float(a_w[1]))
+            blat, blon = xy_to_ll(ctx["to_wgs"], float(b_w[0]), float(b_w[1]))
+
+            arrow_paths_ll.append({"path": [[float(alon), float(alat)], [float(blon), float(blat)]]})
+            vectors_ll.append({"lon0": float(alon), "lat0": float(alat), "lon1": float(blon), "lat1": float(blat)})
+
+        startline_overlay = {
+            "SL_points": pts_ll,
+            "SL_arrow_paths": arrow_paths_ll,  # (shaft only)
+            "SL_vectors": vectors_ll,          # compat
+            "Tref_s": float(Tmax),
+        }
 
     # --- Groups
     g_first_dw = compute_route_group(
@@ -424,15 +444,7 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
         A_twa_sign=-1,
     )
 
-    # Apply filtering
-    g_uw_lg2["routes"] = _filter_group_routes_full_uw(g_uw_lg2["routes"])   # UW unchanged
-    g_uw_lg1["routes"] = _filter_group_routes_full_uw(g_uw_lg1["routes"])   # UW unchanged
-    g_dw_wg2["routes"] = _filter_group_routes_full_dw(g_dw_wg2["routes"])   # DW: keep one prime
-    g_dw_wg1["routes"] = _filter_group_routes_full_dw(g_dw_wg1["routes"])   # DW: keep one prime
-
-    # =============================
     # Convert routes to WORLD LL for viz + colors
-    # =============================
     def _routes_to_world(group_out: dict) -> list[dict]:
         routes = group_out.get("routes", [])
         for r in routes:
@@ -453,23 +465,12 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
     routes_2 = _routes_to_world(g_uw_lg2) + _routes_to_world(g_uw_lg1)
     routes_3 = _routes_to_world(g_dw_wg2) + _routes_to_world(g_dw_wg1)
 
-    # Final safety: ensure B never appears in FULL DW
-    routes_3 = [r for r in routes_3 if str(r.get("traj", "")).strip() != "B"]
+    out1 = {**biases, "TWD": float(TWD), "routes": routes_1, "vmg_info": []}
+    if startline_overlay is not None:
+        out1["startline_overlay"] = startline_overlay
 
-    # VMG info per card
-    vmg1 = [{"group": g_first_dw["group_id"], "leg": g_first_dw["leg_type"], "TWA": g_first_dw["TWA_vmg_abs_deg"], "BSP": g_first_dw["BSP_vmg_kmph"]}]
-    vmg2 = [
-        {"group": g_uw_lg2["group_id"], "leg": g_uw_lg2["leg_type"], "TWA": g_uw_lg2["TWA_vmg_abs_deg"], "BSP": g_uw_lg2["BSP_vmg_kmph"]},
-        {"group": g_uw_lg1["group_id"], "leg": g_uw_lg1["leg_type"], "TWA": g_uw_lg1["TWA_vmg_abs_deg"], "BSP": g_uw_lg1["BSP_vmg_kmph"]},
-    ]
-    vmg3 = [
-        {"group": g_dw_wg2["group_id"], "leg": g_dw_wg2["leg_type"], "TWA": g_dw_wg2["TWA_vmg_abs_deg"], "BSP": g_dw_wg2["BSP_vmg_kmph"]},
-        {"group": g_dw_wg1["group_id"], "leg": g_dw_wg1["leg_type"], "TWA": g_dw_wg1["TWA_vmg_abs_deg"], "BSP": g_dw_wg1["BSP_vmg_kmph"]},
-    ]
-
-    out1 = {**biases, "TWD": float(TWD), "routes": routes_1, "vmg_info": vmg1}
-    out2 = {**biases, "TWD": float(TWD), "routes": routes_2, "vmg_info": vmg2}
-    out3 = {**biases, "TWD": float(TWD), "routes": routes_3, "vmg_info": vmg3}
+    out2 = {**biases, "TWD": float(TWD), "routes": routes_2, "vmg_info": []}
+    out3 = {**biases, "TWD": float(TWD), "routes": routes_3, "vmg_info": []}
 
     lw_bias = float(biases.get("LW_gate_bias_m", float("nan")))
     ww_bias = float(biases.get("WW_gate_bias_m", float("nan")))
