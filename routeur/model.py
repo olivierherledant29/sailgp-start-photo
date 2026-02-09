@@ -406,5 +406,8 @@ def compute_route_group(
         "BSP_vmg_rear_kmph": float(bsp_ref_rear),
         "VMG_vmg_rear_kmph": float(vmg_ref_rear),
 
+        # ✅ AJOUT MINIMAL pour permettre le tri dans embedded
+        "A_twa_sign": int(A_twa_sign),
+
         "routes": [route_A, route_B, route_Ap, route_Bp],
     }

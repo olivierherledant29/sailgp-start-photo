@@ -112,9 +112,6 @@ def _gate_side_label(gate: str, bias_m: float) -> str:
     return "porte WW neutre"
 
 
-# =========================================================
-# Start-line overlay helpers
-# =========================================================
 def _unit(v: np.ndarray) -> np.ndarray:
     n = float(np.linalg.norm(v))
     if n < 1e-9:
@@ -154,7 +151,6 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
         st.error(f"Marques manquantes dans le XML: {', '.join(missing)}")
         return None, None
 
-    # Sidebar: offsets only
     with st.sidebar:
         offset_TWD = st.slider(
             "offset_TWD (°)",
@@ -165,15 +161,11 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
         )
         st.session_state["offset_TWD"] = int(offset_TWD)
 
-        # ✅ NEW: offset_TWS (km/h) in [-10,+10], but clamp min so TWS doesn't go below 0
-        # We'll set actual slider min later once we know TWS_base; keep placeholder in session for now.
         if "offset_TWS" not in st.session_state:
             st.session_state["offset_TWS"] = 0
 
-    # Widgets top row
     c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.6, 1.1])
     with c1:
-        # base only
         TWS_base = st.number_input("TWS_base (km/h)", min_value=0, max_value=50, value=20, step=1, format="%d")
     with c2:
         if "TWD_base" not in st.session_state:
@@ -188,9 +180,8 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
         )
         st.session_state["TWD_base"] = float(TWD_base)
 
-    # now we can build the TWS offset slider with correct minimum
     with st.sidebar:
-        min_off = int(max(-10, -int(TWS_base)))  # if TWS_base<10, min offset stops at -TWS_base
+        min_off = int(max(-10, -int(TWS_base)))
         offset_TWS = st.slider(
             "offset_TWS (km/h)",
             min_value=min_off,
@@ -231,7 +222,6 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
 
     gybe_loss_s = 3.0
 
-    # World geometry
     ctx = make_context_from_boundary(boundary_latlon)
     marks_for_geom = {
         "SL1": marks_ll.get("SL1", marks_ll["M1"]),
@@ -241,7 +231,6 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
     geom = to_xy_marks_and_polys(ctx, marks_for_geom, boundary_latlon, float(size_buffer_BDY))
     marks_xy_world = marks_ll_to_xy(ctx, marks_ll)
 
-    # Rotate into calc frame (wind from top => TWD_calc=180)
     angle_deg_cw = (float(TWD) - 180.0) % 360.0
     angle_rad_ccw = np.deg2rad(angle_deg_cw)
 
@@ -277,11 +266,6 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
     twa_cands = polar_twa_candidates(polar_interp)
     biases = compute_gate_biases(marks_xy_rot, 180.0)
 
-    # =========================================================
-    # Start-line overlay (First DW only): 11 points SL_0..SL_100
-    # VECTEURS SANS FLECHES
-    # Référence: segment le plus long (point le plus lent) => vecteur de longueur 0
-    # =========================================================
     startline_overlay = None
     if "SL1" in marks_xy_rot and "SL2" in marks_xy_rot:
         SL1 = marks_xy_rot["SL1"]
@@ -291,7 +275,7 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
         SL2_7m = _point_along(SL2, SL1, 7.0)
 
         rows = []
-        for i in range(11):  # 0..100%
+        for i in range(11):
             t = i / 10.0
             p = SL2_7m + t * (SL1_7m - SL2_7m)
             x_pct = i * 10
@@ -317,22 +301,16 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
                 )
             )
 
-        # ✅ Référence = temps le plus long (point le plus lent)
         Tmax = max(r["time_s"] for r in rows if np.isfinite(r["time_s"]))
 
-        pts_ll = []
-        arrow_paths_ll = []   # PathLayer segments (just shaft)
-        vectors_ll = []       # LineLayer compat (shaft)
-
+        pts_ll, arrow_paths_ll, vectors_ll = [], [], []
         for r in rows:
-            # ✅ dt = 0 pour le plus lent => vecteur 0
             dt = float(Tmax - r["time_s"])
             dd = _kmph_to_mps(r["bsp_kmph"]) * dt
 
             u_to_M1 = _unit(M1 - r["p_xy"])
             end_xy = r["p_xy"] + dd * u_to_M1
 
-            # point itself (always)
             p_xy_world = _rot_xy_about(np.array(r["p_xy"], dtype=float), origin_xy, -angle_rad_ccw)
             plat, plon = xy_to_ll(ctx["to_wgs"], float(p_xy_world[0]), float(p_xy_world[1]))
             pts_ll.append(
@@ -350,11 +328,9 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
                 )
             )
 
-            # segment (skip if too small)
             if dd < 1e-6:
                 continue
 
-            # build one shaft segment in WORLD LL
             a_w = _rot_xy_about(np.array(r["p_xy"], dtype=float), origin_xy, -angle_rad_ccw)
             b_w = _rot_xy_about(np.array(end_xy, dtype=float), origin_xy, -angle_rad_ccw)
             alat, alon = xy_to_ll(ctx["to_wgs"], float(a_w[0]), float(a_w[1]))
@@ -365,12 +341,12 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
 
         startline_overlay = {
             "SL_points": pts_ll,
-            "SL_arrow_paths": arrow_paths_ll,  # (shaft only)
-            "SL_vectors": vectors_ll,          # compat
+            "SL_arrow_paths": arrow_paths_ll,
+            "SL_vectors": vectors_ll,
             "Tref_s": float(Tmax),
         }
 
-    # --- Groups
+    # --- compute groups
     g_first_dw = compute_route_group(
         group_id="FIRST_DW_M1",
         start_xy=M1_round,
@@ -444,14 +420,110 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
         A_twa_sign=-1,
     )
 
-    # Convert routes to WORLD LL for viz + colors
+    # ---------------------------------------------------------
+    # Tri/filtrage:
+    # - FULL_DW : enlever B
+    # - FULL_UW : garder seulement la prime dont le signe (au départ réel) == -A_twa_sign
+    # - FULL_DW : (PATCH) garder la prime "inverse" de A au départ
+    # ---------------------------------------------------------
+    def _sgn(x: float) -> int:
+        if x > 1e-9:
+            return 1
+        if x < -1e-9:
+            return -1
+        return 0
+
+    def _base_traj(r: dict) -> str:
+        t = str(r.get("traj", r.get("label", ""))).strip()
+        if "—" in t:
+            t = t.split("—")[-1].strip()
+        if " " in t:
+            t = t.split(" ")[0].strip()
+        return t
+
+    def _twa_sign_from_segment(p0: np.ndarray, p1: np.ndarray) -> int:
+        hdg = bearing_deg_xy((float(p0[0]), float(p0[1])), (float(p1[0]), float(p1[1])))
+        twa = wrap180(twa_from_twd_hdg(180.0, float(hdg)))
+        return _sgn(float(twa))
+
+    def _twa_sign_at_start_forward(route: dict) -> int:
+        path = route.get("route_path_xy", [])
+        if not path or len(path) < 2:
+            return 0
+        p0 = np.array(path[0], dtype=float)
+        p1 = np.array(path[1], dtype=float)
+        return _twa_sign_from_segment(p0, p1)
+
+    def _twa_sign_at_start_from_rear(route: dict) -> int:
+        path = route.get("route_path_xy", [])
+        if not path or len(path) < 2:
+            return 0
+        p0 = np.array(path[-2], dtype=float)
+        p1 = np.array(path[-1], dtype=float)
+        return _twa_sign_from_segment(p0, p1)
+
+    def _filter_group_routes(group_out: dict) -> list[dict]:
+        gid = str(group_out.get("group_id", ""))
+        routes = list(group_out.get("routes", []))
+        signA = int(group_out.get("A_twa_sign", 1))
+
+        is_full_uw = gid.startswith("FULL_UW")
+        is_full_dw = gid.startswith("FULL_DW")
+
+        if not (is_full_uw or is_full_dw):
+            return routes
+
+        # signe de A au départ (forward) — utile seulement pour FULL_DW
+        sA_forward = 0
+        for r in routes:
+            if _base_traj(r) == "A":
+                sA_forward = _twa_sign_at_start_forward(r)
+                break
+
+        kept: list[dict] = []
+        for r in routes:
+            bt = _base_traj(r)
+
+            # FULL_DW: enlever B (mais pas B')
+            if is_full_dw and bt == "B":
+                continue
+
+            if bt in ("A'", "B'"):
+                s_prime = _twa_sign_at_start_from_rear(r)
+
+                if is_full_uw:
+                    # UW : règle validée
+                    if s_prime == 0 or s_prime != (-signA):
+                        continue
+
+                if is_full_dw:
+                    # ---- PATCH ICI : choix inverse ----
+                    # Avant: garder si s_prime == sA_forward
+                    # Maintenant: garder si s_prime != sA_forward (en évitant 0)
+                    if sA_forward != 0:
+                        if s_prime == 0:
+                            continue
+                        if s_prime == sA_forward:
+                            continue
+
+            kept.append(r)
+
+        return kept
+
+    g_first_dw["routes"] = _filter_group_routes(g_first_dw)
+    g_uw_lg2["routes"] = _filter_group_routes(g_uw_lg2)
+    g_uw_lg1["routes"] = _filter_group_routes(g_uw_lg1)
+    g_dw_wg2["routes"] = _filter_group_routes(g_dw_wg2)
+    g_dw_wg1["routes"] = _filter_group_routes(g_dw_wg1)
+
     def _routes_to_world(group_out: dict) -> list[dict]:
         routes = group_out.get("routes", [])
+        gid = str(group_out.get("group_id", ""))
+
         for r in routes:
-            traj = str(r.get("traj", r.get("label", "?"))).strip()
-            gid = str(r.get("group_id", group_out.get("group_id", "")))
-            r["traj"] = traj
-            r["color"] = _color_for(gid, traj)
+            bt = _base_traj(r)
+            r["traj"] = bt
+            r["color"] = _color_for(gid, bt)
 
             path_xy_rot = [np.array(p, dtype=float) for p in r.get("route_path_xy", [])]
             path_xy_world = [_rot_xy_about(p, origin_xy, -angle_rad_ccw) for p in path_xy_rot]
