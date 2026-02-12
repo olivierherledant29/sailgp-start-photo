@@ -86,13 +86,13 @@ def rgb_to_css(rgb):
 SECOND_COLORS = {
     ("buffer_BDY", "to_SL1"): [160, 32, 240],
     ("buffer_BDY", "to_SL2"): [0, 255, 255],
-    ("buffer_BDY", "to_SP"):  [165, 42, 42],
-    ("LL_SL1",     "to_SL1"): [112, 128, 144],
-    ("LL_SL1",     "to_SL2"): [0, 128, 128],
-    ("LL_SL1",     "to_SP"):  [138, 43, 226],
-    # NEW trajectory (PI->M_PAR_SL2->SL2_7m)
-    ("PAR_SL2",    "to_SL2"): [255, 140, 0],
+    ("buffer_BDY", "to_SP"): [165, 42, 42],
+    ("LL_SL1", "to_SL1"): [112, 128, 144],
+    ("LL_SL1", "to_SL2"): [0, 128, 128],
+    ("LL_SL1", "to_SP"): [138, 43, 226],
+    ("PAR_SL2", "to_SL2"): [255, 140, 0],
 }
+
 
 def compute_startline_special_points(
     SL1_xy: np.ndarray,
@@ -131,40 +131,37 @@ def compute_all_geometry_and_times(
     M_lost,
     X_percent,
     TTS_intersection,
+    target_TTK_beforeTack: float = 0.0,
 ):
     """
     Compute geometry + timings.
 
-    New inputs (polar-based):
-      - TWS_ref_kmh: reference wind speed (km/h) used for polar interpolation
-      - polar_bsp_kmh(tws_kmh, twa_deg): returns BSP in km/h (bilinear interp)
-      - pol_BAB_pct / pol_TRIB_pct: multipliers in percent applied to polar BSP
+    New:
+      - target_TTK_beforeTack: user target for ttk_before_tack (s)
+      - per route:
+            ttk_before_tack = TTS_intersection - (t1 + t2)
+        => to force ttk_before_tack == target:
+            TTS_target = target + (t1 + t2)
 
-    Notes:
-      - Approach (BAB): uses TWA_port
-      - Return (TRIB): for each (group, dest), compute the heading from M -> target,
-        derive TWA_abs vs TWD, then interpolate polar BSP, then apply pol_TRIB_pct.
+    Table: replace t_total column by TTS_target.
     """
     to_wgs = ctx["to_wgs"]
     SL1_xy, SL2_xy = geom["SL1_xy"], geom["SL2_xy"]
     poly_BDY = geom["poly_BDY"]
     poly_buffer = geom.get("poly_buffer", None)
 
-    # Output dict early (so we can populate progressively)
     out: dict = {}
 
     # Headings (deg, 0=N)
     ANG_port = (float(TWD) + float(TWA_port)) % 360.0
     ANG_UW = (float(TWD) - float(TWA_UW) + 180.0) % 360.0
 
-    # Start line (infinite, only for consistency / debug)
     _ = line_infinite_through_points(SL1_xy, SL2_xy, scale=80000.0)
 
-    # Ray from PI on port approach
     dir_port = heading_to_unit_vector(ANG_port)
     ray_PI = LineString([tuple(PI_xy), tuple(PI_xy + dir_port * 60000.0)])
 
-    # --- Polar-based approach speed (BAB)
+    # Polar-based approach speed (BAB)
     bsp_approche_pol = float(polar_bsp_kmh(float(TWS_ref_kmh), float(TWA_port)))
     bsp_approche_bab = bsp_approche_pol * (float(pol_BAB_pct) / 100.0)
 
@@ -173,6 +170,7 @@ def compute_all_geometry_and_times(
     out["pol_TRIB_pct"] = float(pol_TRIB_pct)
     out["BSP_approche_pol_kmph"] = float(bsp_approche_pol)
     out["BSP_approche_BAB_kmph"] = float(bsp_approche_bab)
+    out["target_TTK_beforeTack"] = float(target_TTK_beforeTack)
 
     # --- M points
     M_buffer_BDY_xy = None
@@ -196,7 +194,6 @@ def compute_all_geometry_and_times(
     if p_ll is not None:
         M_LL_SL1_xy = np.array([p_ll.x, p_ll.y], dtype=float)
 
-    # --- Laylines clipped to boundary (visual)
     def layline_to_boundary(start_xy):
         r = LineString([tuple(start_xy), tuple(start_xy + dir_UW * 120000.0)])
         p = intersection_ray_with_polygon_boundary(r, start_xy, poly_BDY, dir_UW)
@@ -207,10 +204,8 @@ def compute_all_geometry_and_times(
     lay_vis_SL1 = layline_to_boundary(SL1_xy)
     lay_vis_SL2 = layline_to_boundary(SL2_xy)
 
-    # --- Special points on start line
     SL1_7m_xy, SL2_7m_xy, SP_xy = compute_startline_special_points(SL1_xy, SL2_xy, X_percent, offset_m=7.0)
 
-    # --- NEW: Manoeuvre point = intersection(ray_PI, parallel layline through SL2_7m)
     layline_SL2_7m = LineString([tuple(SL2_7m_xy), tuple(SL2_7m_xy + dir_UW * 80000.0)])
     p_par = compute_forward_intersection_between_lines(
         ray_PI=ray_PI,
@@ -231,7 +226,6 @@ def compute_all_geometry_and_times(
     }
     GROUPS = {"buffer_BDY": M_buffer_BDY_xy, "LL_SL1": M_LL_SL1_xy, "PAR_SL2": M_PAR_SL2_xy}
 
-    # --- Paths (for map)
     results = []
     traj_second_segments = []
     first_leg_paths = []
@@ -248,7 +242,6 @@ def compute_all_geometry_and_times(
         M_ll = xy_to_ll(to_wgs, M_PAR_SL2_xy[0], M_PAR_SL2_xy[1])
         first_leg_paths.append({"path": [[PI_ll[1], PI_ll[0]], [M_ll[1], M_ll[0]]], "name": "PI->M_PAR_SL2"})
 
-    # --- Evaluate trajectories
     bsp_retour_vals = []
 
     for gname, M_xy in GROUPS.items():
@@ -261,12 +254,14 @@ def compute_all_geometry_and_times(
         dests_iter = DESTS.items() if gname != "PAR_SL2" else [("to_SL2", SL2_7m_xy)]
 
         for dname, target_xy in dests_iter:
-            # Return heading and TWA (abs) for this segment
             if float(np.linalg.norm(target_xy - M_xy)) < 1e-6:
                 heading_return = float("nan")
                 twa_return = float("nan")
             else:
-                heading_return = _bearing_deg_xy((float(M_xy[0]), float(M_xy[1])), (float(target_xy[0]), float(target_xy[1])))
+                heading_return = _bearing_deg_xy(
+                    (float(M_xy[0]), float(M_xy[1])),
+                    (float(target_xy[0]), float(target_xy[1])),
+                )
                 twa_return = _twa_abs_deg(heading_return, float(TWD))
 
             bsp_retour_pol = float(polar_bsp_kmh(float(TWS_ref_kmh), float(twa_return))) if np.isfinite(twa_return) else float("nan")
@@ -279,17 +274,18 @@ def compute_all_geometry_and_times(
             ttk = float(TTS_intersection) - t_total
             ttk_before_tack = ttk + float(M_lost)
 
+            # Targeted intersection time: enforce ttk_before_tack == target_TTK_beforeTack
+            # because ttk_before_tack = TTS_intersection - (t1 + t2)
+            TTS_intersection_target = float(target_TTK_beforeTack) + (t1 + t2)
+
             color = SECOND_COLORS.get((gname, dname), [255, 255, 255])
 
             M_ll = xy_to_ll(to_wgs, M_xy[0], M_xy[1])
             end_ll = xy_to_ll(to_wgs, target_xy[0], target_xy[1])
 
-            traj_second_segments.append({
-                "group": gname,
-                "dest": dname,
-                "color": color,
-                "path": [[M_ll[1], M_ll[0]], [end_ll[1], end_ll[0]]],
-            })
+            traj_second_segments.append(
+                {"group": gname, "dest": dname, "color": color, "path": [[M_ll[1], M_ll[0]], [end_ll[1], end_ll[0]]]}
+            )
 
             results.append({
                 "group": gname,
@@ -297,6 +293,7 @@ def compute_all_geometry_and_times(
                 "t1": t1,
                 "t2": t2,
                 "t_total": t_total,
+                "TTS_intersection_target": TTS_intersection_target,
                 "ttk_before_tack": ttk_before_tack,
                 "ttk": ttk,
                 "color": color,
@@ -311,7 +308,7 @@ def compute_all_geometry_and_times(
 
     out["BSP_retour_TRIB_avg_kmph"] = float(np.mean(bsp_retour_vals)) if bsp_retour_vals else float("nan")
 
-    # --- Results table HTML
+    # --- Results table HTML (replace t_total column by TTS_target)
     rows = []
     for r in results:
         c = rgb_to_css(r["color"])
@@ -321,7 +318,7 @@ def compute_all_geometry_and_times(
             f"<td>{r['dest']}</td>"
             f"<td style='text-align:right;'>{r['t1']:.1f}</td>"
             f"<td style='text-align:right;'>{r['t2']:.1f}</td>"
-            f"<td style='text-align:right; color:{c}; font-weight:700;'>{r['t_total']:.1f}</td>"
+            f"<td style='text-align:right; color:{c}; font-weight:700;'>{r['TTS_intersection_target']:.1f}</td>"
             f"<td style='text-align:right; color:{c}; font-weight:700;'>{r['ttk_before_tack']:.1f}</td>"
             f"<td style='text-align:right; color:{c}; font-weight:700;'>{r['ttk']:.1f}</td>"
             f"<td style='text-align:right;'>{r['twa_return_abs_deg']:.1f}</td>"
@@ -338,7 +335,7 @@ def compute_all_geometry_and_times(
             <th style="text-align:left; border-bottom:1px solid #666;">dest</th>
             <th style="text-align:right; border-bottom:1px solid #666;">t1 PI→M (s)</th>
             <th style="text-align:right; border-bottom:1px solid #666;">t2 M→target (s)</th>
-            <th style="text-align:right; border-bottom:1px solid #666;">t_total (s)</th>
+            <th style="text-align:right; border-bottom:1px solid #666;">TTS_target (s)</th>
             <th style="text-align:right; border-bottom:1px solid #666;">TTK_beforeTack (s)</th>
             <th style="text-align:right; border-bottom:1px solid #666;">TTK (s)</th>
             <th style="text-align:right; border-bottom:1px solid #666;">TWA_return (°)</th>
@@ -350,6 +347,7 @@ def compute_all_geometry_and_times(
         </tbody>
       </table>
       <div style="margin-top:6px; color:#aaa;">
+        TTS_target = target_TTK_beforeTack({float(target_TTK_beforeTack):.1f}s) + (t1 + t2) <br/>
         t_total = t1(BSP_approche_BAB={float(bsp_approche_bab):.1f} km/h) + t2(BSP_retour_TRIB=pol(TWS_ref={float(TWS_ref_kmh):.1f},TWA_return)*{float(pol_TRIB_pct):.0f}%) + M_lost({float(M_lost):.1f}s) <br/>
         TTK = TTS_intersection({float(TTS_intersection):.1f}s) − t_total <br/>
         TTK_beforeTack = TTK + M_lost
@@ -374,5 +372,7 @@ def compute_all_geometry_and_times(
         "SL1_7m_xy": SL1_7m_xy,
         "SL2_7m_xy": SL2_7m_xy,
         "SP_xy": SP_xy,
+        "TTS_intersection": float(TTS_intersection),
+        "target_TTK_beforeTack": float(target_TTK_beforeTack),
     })
     return out
