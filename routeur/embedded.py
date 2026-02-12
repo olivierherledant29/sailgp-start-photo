@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -83,17 +83,25 @@ def _color_for(group_id: str, traj: str) -> list[int]:
     k = TRAJ_SHADE.get(traj, 1.0)
     return [int(base[0] * k), int(base[1] * k), int(base[2] * k)]
 
-
 def _guess_twd_from_xml_filename() -> float:
+    import re
+
     name = st.session_state.get("boundary_xml_name", None)
-    if not isinstance(name, str) or len(name) < 3:
+    if not isinstance(name, str) or not name.strip():
         return 0.0
-    prefix = name.strip()[:3]
-    if prefix.isdigit():
-        x = float(int(prefix))
-        if 0.0 <= x <= 360.0:
-            return x
+
+    # Cherche: 3 chiffres (0-3xx) suivis d'espaces optionnels, puis '.' puis 1+ chiffres
+    # Ex: "260 .75_race" ou "090.7"
+    m = re.search(r"\b([0-3]\d{2})\s*\.\s*\d+", name)
+    if not m:
+        return 0.0
+
+    x = int(m.group(1))
+    if 0 <= x <= 360:
+        return float(x)
     return 0.0
+
+
 
 
 def _gate_side_label(gate: str, bias_m: float) -> str:
