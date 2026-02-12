@@ -23,3 +23,9 @@ Thumbs.db
 # Polaires (on versionne ces CSV-là)
 !start_aid/polars/
 !start_aid/polars/*.csv
+
+# local debug
+find_pois_after.py
+test_pois_channels.py
+nul
+openapi.json
