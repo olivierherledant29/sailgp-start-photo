@@ -1,10 +1,13 @@
 import streamlit as st
 
+
+
+
 st.set_page_config(page_title="SailGP Start Photo", layout="wide")
 st.title("SailGP – Start Photo")
 
 st.write("Choisir le mode :")
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 
 with c1:
     st.subheader("Replay")
@@ -29,3 +32,9 @@ with c4:
     st.write("ouvrir routeur, lit seulement xml et polaire")
     if st.button("Ouvrir routeur"):
         st.switch_page("pages/4_Routeur.py")
+
+with c5:
+    st.subheader("board cycles count")
+    st.write("Compteur babord/tribord (manuel) + POIs API (beta).")
+    if st.button("Ouvrir board cycles count"):
+        st.switch_page("pages/5_Board_Cycles_Count.py")
