@@ -142,34 +142,31 @@ def _render_next_start_timer() -> None:
     tts_corr = tts + offset_s
 
     st.markdown(
-    f"""
-<div style="text-align:center; margin-top:20px;">
-
-  <div style="
-        font-size:120px;
-        font-weight:700;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        color:#00BFFF;">
-        {_fmt_mmss(tts)}
+        """
+<div style="text-align:center; margin-top: 10px;">
+  <div style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+              font-size: 18px; opacity: 0.8;">
+    Start (UTC): <b>{start}</b> &nbsp;&nbsp; Offset: <b>{off}</b>
   </div>
 
-  <div style="
-        font-size:120px;
-        font-weight:700;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        color:#FF7F00;">
-        {_fmt_mmss(tts_corr)}
+  <div style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+              font-size: 100px; font-weight: 800; line-height: 1.05; color: #00BFFF;">
+    {tts}
   </div>
 
-  <div style="margin-top:10px; font-size:18px; opacity:0.7;">
-        Offset: {offset_s:+.1f}s
+  <div style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+              font-size: 100px; font-weight: 800; line-height: 1.05; color: #FF7F00;">
+    {ttso}
   </div>
-
 </div>
-""",
-    unsafe_allow_html=True
-)
-
+""".format(
+            start=target.strftime("%H:%M:%S"),
+            tts=_fmt_mmss(tts),
+            ttso=_fmt_mmss(tts_corr),
+            off=f"{offset_s:+.1f}s",
+        ),
+        unsafe_allow_html=True,
+    )
 
     # -----------------------
     # Auto-refresh 1 Hz when ON
@@ -201,23 +198,30 @@ def _count(history: deque) -> int:
     return len(history)
 
 
-def _timer_to_five(history: deque) -> int:
-    """
-    Seconds until count drops to 5.
-    Correct logic: timer is based on the (count-5)-th oldest event.
+def _timer_to_k(history: deque, k: int) -> int:
+    """Seconds until count drops to k within the rolling WINDOW.
+
+    If current count <= k, returns 0.
+
+    Logic: once we have n events in the last WINDOW seconds (timestamps sorted by insertion),
+    to reach exactly k we must let (n-k) oldest events expire. The last of those to expire
+    is the (n-k)-th oldest event, at index (n-k-1).
     """
     now = time.time()
     _cleanup(history, now)
     n = len(history)
-    if n < 6:
+    if n <= k:
         return 0
 
-    # Need to lose (n-5) events; the last one to expire is index (n-5)
-    idx = (n - 5) - 1  # 0-based
+    idx = (n - k) - 1  # 0-based
     ts_limit = history[idx]
     remaining = int((ts_limit + WINDOW) - now)
     return max(remaining, 0)
 
+
+def _timer_to_five(history: deque) -> int:
+    # Backward-compatible helper (1 move remaining case)
+    return _timer_to_k(history, 5)
 
 def _colored_dispo(value: int, color_hex: str) -> str:
     return f"<span style='color:{color_hex}; font-weight:700'>{value}</span>"
@@ -240,51 +244,64 @@ st.caption(
 )
 
 if mode == "Manuel (boutons Streamlit)":
-    colA, colB, colC = st.columns([1.2, 1.2, 2.6])
+    # Controls (Babord / Tribord side-by-side) + Live line
+    col_controls, col_live = st.columns([2.2, 5.0])
 
-    with colA:
-        st.subheader("Babord")
-        if st.button("➕ +1 Babord", use_container_width=True):
-            st.session_state.press_history["babord"].append(time.time())
-        if st.button("↩️ Undo Babord (-1)", use_container_width=True):
-            if st.session_state.press_history["babord"]:
-                st.session_state.press_history["babord"].popleft()
+    with col_controls:
+        st.subheader("Moves")
 
-    with colB:
-        st.subheader("Tribord")
-        if st.button("➕ +1 Tribord", use_container_width=True):
-            st.session_state.press_history["tribord"].append(time.time())
-        if st.button("↩️ Undo Tribord (-1)", use_container_width=True):
-            if st.session_state.press_history["tribord"]:
-                st.session_state.press_history["tribord"].popleft()
+        c_bab, c_tri = st.columns(2, gap="small")
 
-    with colC:
+        with c_bab:
+            st.markdown("**Babord**")
+            if st.button("➕ +1", key="bab_plus", use_container_width=True):
+                st.session_state.press_history["babord"].append(time.time())
+            if st.button("↩️ -1", key="bab_undo", use_container_width=True):
+                if st.session_state.press_history["babord"]:
+                    st.session_state.press_history["babord"].popleft()
+
+        with c_tri:
+            st.markdown("**Tribord**")
+            if st.button("➕ +1", key="tri_plus", use_container_width=True):
+                st.session_state.press_history["tribord"].append(time.time())
+            if st.button("↩️ -1", key="tri_undo", use_container_width=True):
+                if st.session_state.press_history["tribord"]:
+                    st.session_state.press_history["tribord"].popleft()
+
+    with col_live:
         st.subheader("Live (refresh 1 Hz)")
-        st.caption("Affichage identique à ton format console, mais rendu dans Streamlit.")
+        st.caption("Affichage identique à ton format console, rendu dans Streamlit.")
 
         if _HAS_AUTOREFRESH:
             st_autorefresh(interval=1000, key="boardcount_refresh")
         else:
             st.info("Astuce: `pip install streamlit-autorefresh` pour un refresh 1 Hz.")
 
-
         hist_b = st.session_state.press_history["babord"]
         hist_t = st.session_state.press_history["tribord"]
 
         count_b = _count(hist_b)
-        tr_b = _timer_to_five(hist_b)
+        tr_1move_b = _timer_to_k(hist_b, 5)
+        tr_2moves_b = _timer_to_k(hist_b, 4)
         dispo_b = max(6 - count_b, 0)
 
         count_t = _count(hist_t)
-        tr_t = _timer_to_five(hist_t)
+        tr_1move_t = _timer_to_k(hist_t, 5)
+        tr_2moves_t = _timer_to_k(hist_t, 4)
         dispo_t = max(6 - count_t, 0)
 
         line = (
-            f"Count_B: {count_b}  |  tr_B: {tr_b}  |  dispo_BAB: {_colored_dispo(dispo_b, RED)}"
-            f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
-            f"Count_T: {count_t}  |  tr_T: {tr_t}  |  dispo_TRIB: {_colored_dispo(dispo_t, GREEN)}"
+            f"Count_B:{count_b} | tr_1move_B:{tr_1move_b} | tr_2moves_B:{tr_2moves_b} | dispo_BAB:{_colored_dispo(dispo_b, RED)}"
+            f"&nbsp;&nbsp;&nbsp; "
+            f"Count_T:{count_t} | tr_1move_T:{tr_1move_t} | tr_2moves_T:{tr_2moves_t} | dispo_TRIB:{_colored_dispo(dispo_t, GREEN)}"
         )
-        st.markdown(line, unsafe_allow_html=True)
+
+        # Police réduite pour tenir sur une seule ligne (scroll horizontal en fallback si écran trop étroit)
+        st.markdown(
+            f"<div style='font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, Courier New, monospace; "
+            f"font-size: 12px; white-space: nowrap; overflow-x: auto;'>{line}</div>",
+            unsafe_allow_html=True,
+        )
 
         with st.expander("Debug (timestamps dans la fenêtre 60s)"):
             now = time.time()
