@@ -1,12 +1,17 @@
 import os
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 import streamlit as st
 
-from streamlit_autorefresh import st_autorefresh
+try:
+    from streamlit_autorefresh import st_autorefresh
+    _HAS_AUTOREFRESH = True
+except Exception:
+    st_autorefresh = None  # type: ignore
+    _HAS_AUTOREFRESH = False
 
 st.set_page_config(page_title="Board cycles count", layout="wide")
 st.title("Board cycles count")
@@ -16,6 +21,164 @@ WINDOW = 60  # seconds
 # Streamlit HTML colors
 RED = "#ff3b30"
 GREEN = "#34c759"
+
+
+def _fmt_mmss(seconds: float) -> str:
+    sign = "-" if seconds < 0 else ""
+    s = abs(int(seconds))
+    return f"{sign}{s//60:02d}:{s%60:02d}"
+
+
+def _render_next_start_timer() -> None:
+    """Next start countdown (UTC) + display offset (0.1s steps).
+
+    Streamlit-friendly: no infinite loop; we re-run at 1 Hz only when ON.
+    """
+
+    # -----------------------
+    # Session state
+    # -----------------------
+    if "ns_running" not in st.session_state:
+        st.session_state.ns_running = False
+
+    now_utc = datetime.now(timezone.utc)
+    if "ns_hour" not in st.session_state:
+        st.session_state.ns_hour = now_utc.hour
+    if "ns_min" not in st.session_state:
+        st.session_state.ns_min = (now_utc.minute + 1) % 60
+    if "ns_offset_tenths" not in st.session_state:
+        st.session_state.ns_offset_tenths = 0  # 0.1s steps
+
+    # -----------------------
+    # Header row: clock + on/off
+    # -----------------------
+    c0, c1 = st.columns([1.2, 1.0])
+    with c0:
+        st.metric("UTC", now_utc.strftime("%H:%M:%S"))
+    with c1:
+        st.session_state.ns_running = st.toggle("Timer ON", value=st.session_state.ns_running)
+
+    st.caption("Choix du prochain départ (UTC)")
+
+    # -----------------------
+    # Start selection: hour + minute with +/-
+    # -----------------------
+    ch, cm = st.columns([1.2, 1.2])
+
+    with ch:
+        bh1, bh2, bh3 = st.columns([0.6, 1.0, 0.6])
+        with bh1:
+            if st.button("−", key="ns_hour_minus"):
+                st.session_state.ns_hour = (int(st.session_state.ns_hour) - 1) % 24
+        with bh2:
+            st.session_state.ns_hour = st.number_input(
+                "Heure",
+                min_value=0,
+                max_value=23,
+                value=int(st.session_state.ns_hour),
+                step=1,
+                key="ns_hour_input",
+            )
+        with bh3:
+            if st.button("+", key="ns_hour_plus"):
+                st.session_state.ns_hour = (int(st.session_state.ns_hour) + 1) % 24
+
+    with cm:
+        bm1, bm2, bm3 = st.columns([0.6, 1.0, 0.6])
+        with bm1:
+            if st.button("−", key="ns_min_minus"):
+                st.session_state.ns_min = (int(st.session_state.ns_min) - 1) % 60
+        with bm2:
+            st.session_state.ns_min = st.number_input(
+                "Minutes",
+                min_value=0,
+                max_value=59,
+                value=int(st.session_state.ns_min),
+                step=1,
+                key="ns_min_input",
+            )
+        with bm3:
+            if st.button("+", key="ns_min_plus"):
+                st.session_state.ns_min = (int(st.session_state.ns_min) + 1) % 60
+
+    # -----------------------
+    # Offset display (0.1s steps)
+    # -----------------------
+    st.caption("Offset sur le décompte affiché (dixièmes de seconde)")
+    co1, co2, co3, co4 = st.columns([0.9, 1.2, 0.9, 1.4])
+
+    with co1:
+        if st.button("−0.1s", key="ns_off_minus"):
+            st.session_state.ns_offset_tenths = int(st.session_state.ns_offset_tenths) - 1
+    with co2:
+        st.session_state.ns_offset_tenths = st.number_input(
+            "Offset (x0.1s)",
+            value=int(st.session_state.ns_offset_tenths),
+            step=1,
+            key="ns_off_input",
+            help="+1 = +0.1s ajouté au décompte ; -1 = -0.1s",
+        )
+    with co3:
+        if st.button("+0.1s", key="ns_off_plus"):
+            st.session_state.ns_offset_tenths = int(st.session_state.ns_offset_tenths) + 1
+    with co4:
+        offset_s = float(st.session_state.ns_offset_tenths) / 10.0
+        st.write(f"Offset = **{offset_s:+.1f}s**")
+
+    # -----------------------
+    # Compute target datetime (UTC) for today; if passed => tomorrow
+    # -----------------------
+    now_utc = datetime.now(timezone.utc)
+    target = now_utc.replace(
+        hour=int(st.session_state.ns_hour),
+        minute=int(st.session_state.ns_min),
+        second=0,
+        microsecond=0,
+    )
+    if target < now_utc:
+        target += timedelta(days=1)
+
+    tts = (target - now_utc).total_seconds()
+    tts_corr = tts + offset_s
+
+    st.markdown(
+    f"""
+<div style="text-align:center; margin-top:20px;">
+
+  <div style="
+        font-size:120px;
+        font-weight:700;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        color:#00BFFF;">
+        {_fmt_mmss(tts)}
+  </div>
+
+  <div style="
+        font-size:120px;
+        font-weight:700;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        color:#FF7F00;">
+        {_fmt_mmss(tts_corr)}
+  </div>
+
+  <div style="margin-top:10px; font-size:18px; opacity:0.7;">
+        Offset: {offset_s:+.1f}s
+  </div>
+
+</div>
+""",
+    unsafe_allow_html=True
+)
+
+
+    # -----------------------
+    # Auto-refresh 1 Hz when ON
+    # -----------------------
+    if st.session_state.ns_running:
+        if _HAS_AUTOREFRESH:
+            st_autorefresh(interval=1000, key="next_start_refresh")
+        else:
+            st.info("Installe `streamlit-autorefresh` pour animer le timer en continu (1 Hz).")
 
 
 def _ensure_state():
@@ -98,8 +261,11 @@ if mode == "Manuel (boutons Streamlit)":
     with colC:
         st.subheader("Live (refresh 1 Hz)")
         st.caption("Affichage identique à ton format console, mais rendu dans Streamlit.")
-        
-        st_autorefresh(interval=1000, key="boardcount_refresh")
+
+        if _HAS_AUTOREFRESH:
+            st_autorefresh(interval=1000, key="boardcount_refresh")
+        else:
+            st.info("Astuce: `pip install streamlit-autorefresh` pour un refresh 1 Hz.")
 
 
         hist_b = st.session_state.press_history["babord"]
@@ -177,3 +343,7 @@ else:
 
         st.write("Aperçu POIs (20 premiers):")
         st.json(pois[:20])
+
+
+st.divider()
+_render_next_start_timer()
