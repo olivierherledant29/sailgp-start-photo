@@ -7,3 +7,5 @@ python-dotenv
 streamlit-autorefresh
 shapely
 pyproj
+requests
+plotly
