@@ -17,7 +17,7 @@ st.markdown(
     h2,h3 {margin:0.1rem 0 !important;}
     .block-container {padding-top:0.5rem !important; padding-bottom:0.3rem !important;}
     div[data-testid="element-container"] {margin-bottom:0.1rem !important;}
-    div[data-testid="stPlotlyChart"] {margin-top:-0.2rem !important;}
+    div[data-testid="stPlotlyChart"] {margin-top:-0.2rem !important; margin-bottom:-0.2rem !important;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -518,7 +518,7 @@ def _build_comparison_figure(ref_dt: datetime, poi_events: list[dict[str, Any]],
         showgrid=False,
     )
     fig.update_layout(
-        height=360,
+        height=240,
         margin=dict(l=20, r=20, t=20, b=20),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         paper_bgcolor="rgba(0,0,0,0)",
@@ -682,7 +682,7 @@ mode = st.radio("Mode", ["Manuel", "POI API", "Manuel + POI"], horizontal=True)
 
 if mode == "Manuel":
     _render_manual_controls()
-    # removed divider for compact UI
+    # divider removed for compact UI
     _render_next_start_timer()
 elif mode == "POI API":
     _render_poi_modes(combined=False)
