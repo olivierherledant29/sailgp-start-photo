@@ -7,6 +7,21 @@ from typing import Any
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+
+# ===== Compact UI CSS =====
+import streamlit as st
+st.markdown(
+    """
+    <style>
+    h1 {font-size:1.6rem !important; margin:0.1rem 0 !important;}
+    h2,h3 {margin:0.1rem 0 !important;}
+    .block-container {padding-top:0.5rem !important; padding-bottom:0.3rem !important;}
+    div[data-testid="element-container"] {margin-bottom:0.1rem !important;}
+    div[data-testid="stPlotlyChart"] {margin-top:-0.2rem !important;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -32,9 +47,11 @@ GREEN = "#34c759"
 ORANGE = "#ff9500"
 YELLOW = "#ffd60a"
 BLUE = "#0a84ff"
-GRAY = "#9aa0a6"
 
 
+# -----------------------------
+# Generic helpers
+# -----------------------------
 def _fmt_mmss(seconds: float) -> str:
     sign = "-" if seconds < 0 else ""
     s = abs(int(seconds))
@@ -43,6 +60,26 @@ def _fmt_mmss(seconds: float) -> str:
 
 def _colored_dispo(value: int, color_hex: str) -> str:
     return f"<span style='color:{color_hex}; font-weight:700'>{value}</span>"
+
+
+def _result_line_html(count_b: int, tr1_b: int, tr2_b: int, dispo_b: int,
+                      count_t: int, tr1_t: int, tr2_t: int, dispo_t: int) -> str:
+    return f"""
+    <div style="width:100%; font-size:18px; display:flex; justify-content:space-between; white-space:nowrap;">
+        <div>
+            Count_B:{count_b} |
+            tr_1move_B:{tr1_b} |
+            tr_2moves_B:{tr2_b} |
+            dispo_BAB:{_colored_dispo(dispo_b, RED)}
+        </div>
+        <div>
+            Count_T:{count_t} |
+            tr_1move_T:{tr1_t} |
+            tr_2moves_T:{tr2_t} |
+            dispo_TRIB:{_colored_dispo(dispo_t, GREEN)}
+        </div>
+    </div>
+    """
 
 
 # -----------------------------
@@ -120,24 +157,26 @@ def _render_manual_controls() -> None:
     with c_right:
         m = _manual_metrics()
         st.markdown(
-            f"""
-            <div style="width:100%; font-size:18px; display:flex; justify-content:space-between; white-space:nowrap;">
-                <div>
-                    Count_B:{m['count_b']} |
-                    tr_1move_B:{m['tr1_b']} |
-                    tr_2moves_B:{m['tr2_b']} |
-                    dispo_BAB:{_colored_dispo(m['dispo_b'], RED)}
-                </div>
-                <div>
-                    Count_T:{m['count_t']} |
-                    tr_1move_T:{m['tr1_t']} |
-                    tr_2moves_T:{m['tr2_t']} |
-                    dispo_TRIB:{_colored_dispo(m['dispo_t'], GREEN)}
-                </div>
-            </div>
-            """,
+            _result_line_html(
+                m["count_b"], m["tr1_b"], m["tr2_b"], m["dispo_b"],
+                m["count_t"], m["tr1_t"], m["tr2_t"], m["dispo_t"],
+            ),
             unsafe_allow_html=True,
         )
+
+
+def _manual_events_last_graph_window(ref_dt: datetime) -> list[dict[str, Any]]:
+    _ensure_manual_state()
+    start = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S)
+    end = ref_dt + timedelta(seconds=GRAPH_LOOKAHEAD_S)
+    out: list[dict[str, Any]] = []
+    for side_key, side_name in [("babord", "port"), ("tribord", "starboard")]:
+        for ts in list(st.session_state.press_history[side_key]):
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            if start <= dt <= end:
+                out.append({"dt": dt, "side": side_name, "type": "manual"})
+    out.sort(key=lambda x: x["dt"])
+    return out
 
 
 # -----------------------------
@@ -241,7 +280,8 @@ def _ensure_poi_state() -> None:
         "poi_fake_cursor_dt": datetime(2026, 3, 1, 6, 55, 0, tzinfo=timezone.utc),
         "poi_live_boat": "FRA",
         "poi_fake_boat": "ESP",
-        "poi_dedup": False,
+        "poi_last_tick": None,
+        "poi_refresh_seconds_prev": 2,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -288,146 +328,140 @@ def _get_board_side(poi_id: str) -> str | None:
 def _normalize_poi_events(raw_pois: list[dict[str, Any]]) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for p in raw_pois:
-        poi_type = (p.get("type") or "").lower()
-        if poi_type not in {"boarddrop", "boardraise"}:
+        ptype = (p.get("type") or "").lower()
+        if ptype not in {"boarddrop", "boardraise", "boardmovepenalty"}:
             continue
+        ts = p.get("start_datetime")
         poi_id = p.get("poi_id")
-        start_dt = p.get("start_datetime")
-        if not poi_id or not start_dt:
+        if not ts or not poi_id:
             continue
         try:
-            dt = datetime.fromisoformat(start_dt.replace("Z", "+00:00")).astimezone(timezone.utc)
+            dt = datetime.fromisoformat(ts).astimezone(timezone.utc)
         except Exception:
             continue
-        side = _get_board_side(str(poi_id))
-        if side not in {"port", "starboard"}:
-            side = None
+        side = _get_board_side(poi_id)
         events.append({
-            "poi_id": str(poi_id),
             "dt": dt,
-            "type": poi_type,
+            "type": ptype,
+            "poi_id": poi_id,
             "side": side,
         })
     events.sort(key=lambda x: x["dt"])
     return events
 
 
-def _dedup_poi_events(events: list[dict[str, Any]], enabled: bool) -> list[dict[str, Any]]:
-    if not enabled:
-        return events
+def _dedup_poi_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     last_type_by_side: dict[str, str] = {}
     out: list[dict[str, Any]] = []
     for e in events:
         side = e.get("side")
-        typ = e.get("type")
+        ptype = e.get("type")
         if side not in {"port", "starboard"}:
             out.append(e)
             continue
-        if last_type_by_side.get(side) == typ:
-            continue
-        last_type_by_side[side] = typ
-        out.append(e)
+        if last_type_by_side.get(side) != ptype:
+            out.append(e)
+            last_type_by_side[side] = ptype
     return out
 
 
-def _count_side_events_last_minute(events: list[dict[str, Any]], ref_dt: datetime, side: str) -> list[datetime]:
-    cutoff = ref_dt - timedelta(seconds=WINDOW)
-    times = [e["dt"] for e in events if e.get("side") == side and cutoff <= e["dt"] <= ref_dt]
+def _events_in_window(events: list[dict[str, Any]], ref_dt: datetime, seconds: int) -> list[dict[str, Any]]:
+    start = ref_dt - timedelta(seconds=seconds)
+    return [e for e in events if start <= e["dt"] <= ref_dt]
+
+
+def _timer_from_events(events: list[dict[str, Any]], ref_dt: datetime, side: str, target_count: int) -> int:
+    times = [e["dt"] for e in events if e.get("side") == side and e.get("type") in {"boarddrop", "boardraise"}]
     times.sort()
-    return times
-
-
-def _timer_until_count_from_datetimes(times: list[datetime], ref_dt: datetime, target_count: int) -> int:
     n = len(times)
     if n <= target_count:
         return 0
     idx = (n - target_count) - 1
-    limit_dt = times[idx] + timedelta(seconds=WINDOW)
-    return max(int((limit_dt - ref_dt).total_seconds()), 0)
+    limit_dt = times[idx]
+    return max(int((limit_dt + timedelta(seconds=WINDOW) - ref_dt).total_seconds()), 0)
 
 
 def _poi_metrics(events: list[dict[str, Any]], ref_dt: datetime) -> dict[str, int]:
-    bab = _count_side_events_last_minute(events, ref_dt, "port")
-    tri = _count_side_events_last_minute(events, ref_dt, "starboard")
+    events_60 = _events_in_window(events, ref_dt, WINDOW)
+    count_b = sum(1 for e in events_60 if e.get("side") == "port" and e.get("type") in {"boarddrop", "boardraise"})
+    count_t = sum(1 for e in events_60 if e.get("side") == "starboard" and e.get("type") in {"boarddrop", "boardraise"})
     return {
-        "count_b": len(bab),
-        "tr1_b": _timer_until_count_from_datetimes(bab, ref_dt, 5),
-        "tr2_b": _timer_until_count_from_datetimes(bab, ref_dt, 4),
-        "dispo_b": max(6 - len(bab), 0),
-        "count_t": len(tri),
-        "tr1_t": _timer_until_count_from_datetimes(tri, ref_dt, 5),
-        "tr2_t": _timer_until_count_from_datetimes(tri, ref_dt, 4),
-        "dispo_t": max(6 - len(tri), 0),
+        "count_b": count_b,
+        "tr1_b": _timer_from_events(events_60, ref_dt, "port", 5),
+        "tr2_b": _timer_from_events(events_60, ref_dt, "port", 4),
+        "dispo_b": max(6 - count_b, 0),
+        "count_t": count_t,
+        "tr1_t": _timer_from_events(events_60, ref_dt, "starboard", 5),
+        "tr2_t": _timer_from_events(events_60, ref_dt, "starboard", 4),
+        "dispo_t": max(6 - count_t, 0),
     }
 
 
 def _poi_summary(events: list[dict[str, Any]], ref_dt: datetime) -> dict[str, int]:
-    start = ref_dt - timedelta(minutes=10)
-    summary = {
-        "drop_b": 0, "drop_t": 0, "raise_b": 0, "raise_t": 0, "unknown": 0,
-    }
-    for e in events:
-        if not (start <= e["dt"] <= ref_dt):
-            continue
+    events_10 = _events_in_window(events, ref_dt, 600)
+    out = {"drop_b": 0, "drop_t": 0, "raise_b": 0, "raise_t": 0, "unknown": 0}
+    for e in events_10:
         side = e.get("side")
-        typ = e.get("type")
-        if side == "port" and typ == "boarddrop":
-            summary["drop_b"] += 1
-        elif side == "starboard" and typ == "boarddrop":
-            summary["drop_t"] += 1
-        elif side == "port" and typ == "boardraise":
-            summary["raise_b"] += 1
-        elif side == "starboard" and typ == "boardraise":
-            summary["raise_t"] += 1
-        else:
-            summary["unknown"] += 1
-    return summary
+        ptype = e.get("type")
+        if ptype == "boarddrop":
+            if side == "port":
+                out["drop_b"] += 1
+            elif side == "starboard":
+                out["drop_t"] += 1
+            else:
+                out["unknown"] += 1
+        elif ptype == "boardraise":
+            if side == "port":
+                out["raise_b"] += 1
+            elif side == "starboard":
+                out["raise_t"] += 1
+            else:
+                out["unknown"] += 1
+    return out
 
 
-# -----------------------------
-# Graph
-# -----------------------------
-def _build_comparison_figure(
-    ref_dt: datetime,
-    poi_events: list[dict[str, Any]],
-    poi_metrics: dict[str, int] | None,
-    manual_events: list[dict[str, Any]] | None = None,
-) -> go.Figure:
+def _build_comparison_figure(ref_dt: datetime, poi_events: list[dict[str, Any]], poi_metrics: dict[str, int] | None,
+                             manual_events: list[dict[str, Any]] | None = None) -> go.Figure:
     x0 = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S)
     x1 = ref_dt + timedelta(seconds=GRAPH_LOOKAHEAD_S)
 
-    fig = go.Figure()
-
-    # Y lanes (top -> bottom via reversed axis)
     lanes = {
-        "raise_t": 5,
-        "manual_t": 4,
-        "drop_t": 3,
-        "raise_b": 2,
-        "manual_b": 1,
-        "drop_b": 0,
+        "raise": 1.0,
+        "drop": 0.0,
+        "penalty": -1.0,
+        "manual_b": 0.25,
+        "manual_t": 0.75,
     }
 
-    # POI traces (circles)
-    for side, color in [("port", RED), ("starboard", GREEN)]:
-        for typ, lane_key, name in [
-            ("boardraise", "raise_b" if side == "port" else "raise_t", f"POI {'BAB' if side=='port' else 'TRIB'} raise"),
-            ("boarddrop", "drop_b" if side == "port" else "drop_t", f"POI {'BAB' if side=='port' else 'TRIB'} drop"),
-        ]:
-            pts = [e for e in poi_events if e.get("side") == side and e.get("type") == typ and x0 <= e["dt"] <= x1]
-            if not pts:
-                continue
-            fig.add_trace(go.Scatter(
-                x=[e["dt"] for e in pts],
-                y=[lanes[lane_key]] * len(pts),
-                mode="markers",
-                marker=dict(symbol="circle", size=10, color=color),
-                name=name,
-                hovertemplate="%{x|%H:%M:%S}<extra>" + name + "</extra>",
-            ))
+    fig = go.Figure()
 
-    # Manual traces (crosses)
-    if manual_events:
+    # POI traces only
+    for ptype, yval in [("boardraise", lanes["raise"]), ("boarddrop", lanes["drop"])]:
+        for side, color, name in [("port", RED, f"POI {ptype} BAB"), ("starboard", GREEN, f"POI {ptype} TRIB")]:
+            pts = [e for e in poi_events if e["type"] == ptype and e.get("side") == side and x0 <= e["dt"] <= x1]
+            if pts:
+                fig.add_trace(go.Scatter(
+                    x=[e["dt"] for e in pts],
+                    y=[yval] * len(pts),
+                    mode="markers",
+                    marker=dict(symbol="circle", size=10, color=color),
+                    name=name,
+                    hovertemplate="%{x|%H:%M:%S}<extra>" + name + "</extra>",
+                ))
+
+    penalties = [e for e in poi_events if e["type"] == "boardmovepenalty" and x0 <= e["dt"] <= x1]
+    if penalties:
+        fig.add_trace(go.Scatter(
+            x=[e["dt"] for e in penalties],
+            y=[lanes["penalty"]] * len(penalties),
+            mode="markers",
+            marker=dict(symbol="square", size=10, color=RED, line=dict(width=1, color="black")),
+            name="POI penalty",
+            hovertemplate="%{x|%H:%M:%S}<extra>POI penalty</extra>",
+        ))
+
+    # Manual overlay only in combined mode
+    if manual_events is not None:
         for side, color, lane_key, name in [
             ("port", RED, "manual_b", "Manual BAB"),
             ("starboard", GREEN, "manual_t", "Manual TRIB"),
@@ -443,7 +477,7 @@ def _build_comparison_figure(
                     hovertemplate="%{x|%H:%M:%S}<extra>" + name + "</extra>",
                 ))
 
-    # Vertical reference lines
+    # Vertical lines
     for when, color, width in [
         (ref_dt - timedelta(minutes=2), YELLOW, 1),
         (ref_dt - timedelta(minutes=1), RED, 1),
@@ -451,7 +485,7 @@ def _build_comparison_figure(
     ]:
         fig.add_vline(x=when, line_color=color, line_width=width)
 
-    # Future timer markers from POI only
+    # Future POI timer bars
     if poi_metrics:
         for label, sec, double in [
             ("B1", poi_metrics.get("tr1_b", 0), False),
@@ -465,27 +499,24 @@ def _build_comparison_figure(
                     fig.add_vline(x=x, line_color=ORANGE, line_width=1, line_dash="dash")
                     if double:
                         fig.add_vline(x=x + timedelta(milliseconds=300), line_color=ORANGE, line_width=1, line_dash="dash")
-                    fig.add_annotation(x=x, y=5.4, text=label, showarrow=False, font=dict(color=ORANGE, size=10))
+                    fig.add_annotation(x=x, y=1.25, text=label, showarrow=False, font=dict(color=ORANGE, size=10))
 
-    # 10-second grid
     tick0 = x0.replace(microsecond=0)
     fig.update_xaxes(
         range=[x0, x1],
         tick0=tick0,
-        dtick=10000,  # ms on date axis = 10 s
+        dtick=10000,
         showgrid=True,
         gridcolor="rgba(255,255,255,0.12)",
         tickformat="%H:%M:%S",
     )
-
     fig.update_yaxes(
         tickmode="array",
-        tickvals=[5, 4, 3, 2, 1, 0],
-        ticktext=["Raise T", "Manual T", "Drop T", "Raise B", "Manual B", "Drop B"],
-        range=[-0.5, 5.5],
+        tickvals=[1.0, 0.75, 0.25, 0.0, -1.0] if manual_events is not None else [1.0, 0.0, -1.0],
+        ticktext=["Raise", "Manual TRIB", "Manual BAB", "Drop", "Penalty"] if manual_events is not None else ["Raise", "Drop", "Penalty"],
+        range=[-1.5, 1.5],
         showgrid=False,
     )
-
     fig.update_layout(
         height=360,
         margin=dict(l=20, r=20, t=20, b=20),
@@ -496,21 +527,77 @@ def _build_comparison_figure(
     return fig
 
 
-def _manual_events_last_graph_window(ref_dt: datetime) -> list[dict[str, Any]]:
-    _ensure_manual_state()
-    start = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S)
-    out: list[dict[str, Any]] = []
-    for side_key, side_name in [("babord", "port"), ("tribord", "starboard")]:
-        for ts in list(st.session_state.press_history[side_key]):
-            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-            if start <= dt <= ref_dt + timedelta(seconds=GRAPH_LOOKAHEAD_S):
-                out.append({"dt": dt, "side": side_name, "type": "manual"})
-    out.sort(key=lambda x: x["dt"])
-    return out
+# -----------------------------
+# POI fragment renderer
+# -----------------------------
+def _compute_ref_dt(time_mode: str) -> datetime:
+    refresh_s = int(st.session_state.poi_refresh_seconds)
+    now = datetime.now(timezone.utc)
+    if time_mode == "Live":
+        if st.session_state.poi_auto_refresh:
+            last_tick = st.session_state.poi_last_tick
+            if last_tick is None or (now - last_tick).total_seconds() >= refresh_s:
+                st.session_state.poi_last_tick = now
+        return now
+
+    # Faux live
+    if st.session_state.poi_auto_refresh and st.session_state.poi_fake_play:
+        last_tick = st.session_state.poi_last_tick
+        if last_tick is None or (now - last_tick).total_seconds() >= refresh_s:
+            st.session_state.poi_last_tick = now
+            st.session_state.poi_fake_cursor_dt = st.session_state.poi_fake_cursor_dt + timedelta(seconds=refresh_s)
+    return st.session_state.poi_fake_cursor_dt
+
+
+def _render_poi_fragment_body(combined: bool, time_mode: str, boat: str) -> None:
+    ref_dt = _compute_ref_dt(time_mode)
+    st.caption(f"Heure de référence UTC : {ref_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    try:
+        start_graph = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S)
+        raw_pois = _fetch_pois(start_graph, ref_dt, boat, ["boarddrop", "boardraise", "boardmovepenalty"])
+        poi_events = _dedup_poi_events(_normalize_poi_events(raw_pois))
+        pm = _poi_metrics(poi_events, ref_dt)
+    except Exception as e:
+        st.error(f"Lecture POI impossible: {e}")
+        return
+
+    if combined:
+        manual_events = _manual_events_last_graph_window(ref_dt)
+    else:
+        manual_events = None
+
+    if not combined:
+        st.markdown(
+            _result_line_html(pm["count_b"], pm["tr1_b"], pm["tr2_b"], pm["dispo_b"], pm["count_t"], pm["tr1_t"], pm["tr2_t"], pm["dispo_t"]),
+            unsafe_allow_html=True,
+        )
+
+    fig = _build_comparison_figure(ref_dt, poi_events, pm, manual_events)
+    st.plotly_chart(fig, use_container_width=True)
+
+    if combined:
+        st.markdown(
+            _result_line_html(pm["count_b"], pm["tr1_b"], pm["tr2_b"], pm["dispo_b"], pm["count_t"], pm["tr1_t"], pm["tr2_t"], pm["dispo_t"]),
+            unsafe_allow_html=True,
+        )
+
+    if st.button("Bilan 10 min", key=f"summary_btn_{'combo' if combined else 'poi'}"):
+        try:
+            raw_10m = _fetch_pois(ref_dt - timedelta(minutes=10), ref_dt, boat, ["boarddrop", "boardraise", "boardmovepenalty"])
+            ev_10m = _dedup_poi_events(_normalize_poi_events(raw_10m))
+            summary = _poi_summary(ev_10m, ref_dt)
+            st.success(
+                f"**Bilan 10 min** — "
+                f"Drop B:{summary['drop_b']} | Drop T:{summary['drop_t']} | "
+                f"Raise B:{summary['raise_b']} | Raise T:{summary['raise_t']} | Unknown:{summary['unknown']}"
+            )
+        except Exception as e:
+            st.error(f"Bilan 10 min impossible: {e}")
 
 
 # -----------------------------
-# POI mode renderer
+# POI mode wrapper (widgets stable)
 # -----------------------------
 def _render_poi_modes(combined: bool) -> None:
     _ensure_poi_state()
@@ -521,17 +608,38 @@ def _render_poi_modes(combined: bool) -> None:
     else:
         st.subheader("Mode POI API")
 
-    top = st.columns([1.1, 1.2, 1.2, 1.2, 1.4])
+    top = st.columns([1.1, 1.2, 1.4, 1.4])
     with top[0]:
-        time_mode = st.radio("Horloge", ["Live", "Faux live"] if not combined else ["Live"], horizontal=True)
+        time_mode = st.radio("Horloge", ["Live", "Faux live"] if not combined else ["Live"], horizontal=True, key=f"clock_mode_{'combo' if combined else 'poi'}")
     with top[1]:
-        st.session_state.poi_auto_refresh = st.toggle("Auto refresh", value=st.session_state.poi_auto_refresh, key=f"poi_auto_refresh_{'combo' if combined else 'poi'}")
+        st.session_state.poi_auto_refresh = st.toggle(
+            "Auto refresh",
+            value=st.session_state.poi_auto_refresh,
+            key=f"poi_auto_refresh_{'combo' if combined else 'poi'}",
+        )
     with top[2]:
-        st.session_state.poi_refresh_seconds = st.number_input("Refresh (s)", 1, 30, int(st.session_state.poi_refresh_seconds), key=f"poi_refresh_s_{'combo' if combined else 'poi'}")
+        refresh_s = st.number_input(
+            "Refresh (s)",
+            min_value=1,
+            max_value=30,
+            value=int(st.session_state.poi_refresh_seconds),
+            key=f"poi_refresh_s_{'combo' if combined else 'poi'}",
+        )
+        refresh_s = int(refresh_s)
+        if "poi_refresh_seconds_prev" not in st.session_state:
+            st.session_state.poi_refresh_seconds_prev = refresh_s
+        if refresh_s != int(st.session_state.poi_refresh_seconds_prev):
+            st.session_state.poi_refresh_seconds_prev = refresh_s
+            st.session_state.poi_refresh_seconds = refresh_s
+            st.session_state.poi_last_tick = None
+            st.rerun()
+        st.session_state.poi_refresh_seconds = refresh_s
     with top[3]:
-        st.session_state.poi_dedup = st.toggle("Dédup moves", value=st.session_state.poi_dedup, key=f"poi_dedup_{'combo' if combined else 'poi'}")
-    with top[4]:
-        boat = st.text_input("Boat code", value=(st.session_state.poi_live_boat if time_mode == "Live" else st.session_state.poi_fake_boat), key=f"boat_input_{'combo' if combined else time_mode}")
+        boat = st.text_input(
+            "Boat code",
+            value=(st.session_state.poi_live_boat if time_mode == "Live" else st.session_state.poi_fake_boat),
+            key=f"boat_input_{'combo' if combined else time_mode}",
+        )
         if time_mode == "Live":
             st.session_state.poi_live_boat = boat
         else:
@@ -558,91 +666,13 @@ def _render_poi_modes(combined: bool) -> None:
                     0,
                     tzinfo=timezone.utc,
                 )
+                st.session_state.poi_last_tick = None
 
-    # Reference time
-    refresh_ms = int(st.session_state.poi_refresh_seconds) * 1000
-    if time_mode == "Live":
-        ref_dt = datetime.now(timezone.utc)
-        if st.session_state.poi_auto_refresh and _HAS_AUTOREFRESH:
-            st_autorefresh(interval=refresh_ms, key=f"poi_live_refresh_{'combo' if combined else 'poi'}")
-    else:
-        if st.session_state.poi_auto_refresh and st.session_state.poi_fake_play and _HAS_AUTOREFRESH:
-            st_autorefresh(interval=refresh_ms, key=f"poi_fake_refresh_{'combo' if combined else 'poi'}")
-            ref_dt = st.session_state.poi_fake_cursor_dt
-            st.session_state.poi_fake_cursor_dt = ref_dt + timedelta(seconds=int(st.session_state.poi_refresh_seconds))
-        else:
-            ref_dt = st.session_state.poi_fake_cursor_dt
+    @st.fragment(run_every=st.session_state.poi_refresh_seconds)
+    def _render_poi_fragment():
+        _render_poi_fragment_body(combined, time_mode, boat)
 
-    st.caption(f"Heure de référence UTC : {ref_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-
-    # Data fetch windows
-    try:
-        start_graph = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S)
-        raw_pois = _fetch_pois(start_graph, ref_dt, boat, ["boarddrop", "boardraise"])
-        poi_events = _dedup_poi_events(_normalize_poi_events(raw_pois), bool(st.session_state.poi_dedup))
-        pm = _poi_metrics(poi_events, ref_dt)
-    except Exception as e:
-        st.error(f"Lecture POI impossible: {e}")
-        return
-
-    if not combined:
-        st.markdown(
-            f"""
-            <div style="width:100%; font-size:18px; display:flex; justify-content:space-between; white-space:nowrap;">
-                <div>
-                    Count_B:{pm['count_b']} |
-                    tr_1move_B:{pm['tr1_b']} |
-                    tr_2moves_B:{pm['tr2_b']} |
-                    dispo_BAB:{_colored_dispo(pm['dispo_b'], RED)}
-                </div>
-                <div>
-                    Count_T:{pm['count_t']} |
-                    tr_1move_T:{pm['tr1_t']} |
-                    tr_2moves_T:{pm['tr2_t']} |
-                    dispo_TRIB:{_colored_dispo(pm['dispo_t'], GREEN)}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    manual_events = _manual_events_last_graph_window(ref_dt) if combined else None
-    fig = _build_comparison_figure(ref_dt, poi_events, pm, manual_events)
-    st.plotly_chart(fig, use_container_width=True)
-
-    if combined:
-        st.markdown(
-            f"""
-            <div style="width:100%; font-size:18px; display:flex; justify-content:space-between; white-space:nowrap;">
-                <div>
-                    Count_B:{pm['count_b']} |
-                    tr_1move_B:{pm['tr1_b']} |
-                    tr_2moves_B:{pm['tr2_b']} |
-                    dispo_BAB:{_colored_dispo(pm['dispo_b'], RED)}
-                </div>
-                <div>
-                    Count_T:{pm['count_t']} |
-                    tr_1move_T:{pm['tr1_t']} |
-                    tr_2moves_T:{pm['tr2_t']} |
-                    dispo_TRIB:{_colored_dispo(pm['dispo_t'], GREEN)}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    if st.button("Bilan 10 min", key=f"summary_btn_{'combo' if combined else 'poi'}"):
-        try:
-            raw_10m = _fetch_pois(ref_dt - timedelta(minutes=10), ref_dt, boat, ["boarddrop", "boardraise"])
-            ev_10m = _dedup_poi_events(_normalize_poi_events(raw_10m), bool(st.session_state.poi_dedup))
-            summary = _poi_summary(ev_10m, ref_dt)
-            st.success(
-                f"**Bilan 10 min** — "
-                f"Drop B:{summary['drop_b']} | Drop T:{summary['drop_t']} | "
-                f"Raise B:{summary['raise_b']} | Raise T:{summary['raise_t']} | Unknown:{summary['unknown']}"
-            )
-        except Exception as e:
-            st.error(f"Bilan 10 min impossible: {e}")
+    _render_poi_fragment()
 
 
 # -----------------------------
@@ -652,7 +682,7 @@ mode = st.radio("Mode", ["Manuel", "POI API", "Manuel + POI"], horizontal=True)
 
 if mode == "Manuel":
     _render_manual_controls()
-    st.divider()
+    # removed divider for compact UI
     _render_next_start_timer()
 elif mode == "POI API":
     _render_poi_modes(combined=False)
