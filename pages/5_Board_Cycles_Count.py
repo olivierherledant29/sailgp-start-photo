@@ -115,7 +115,7 @@ def _manual_metrics() -> dict[str, int]:
     }
 
 
-def _render_manual_controls() -> None:
+def _render_manual_controls(show_line: bool = True) -> None:
     _ensure_manual_state()
     c_left, c_right = st.columns([1.8, 5.2])
     with c_left:
@@ -140,14 +140,15 @@ def _render_manual_controls() -> None:
                     st.session_state.press_history["tribord"].popleft()
 
     with c_right:
-        m = _manual_metrics()
-        st.markdown(
-            _result_line_html(
-                m["count_b"], m["tr1_b"], m["tr2_b"], m["dispo_b"],
-                m["count_t"], m["tr1_t"], m["tr2_t"], m["dispo_t"],
-            ),
-            unsafe_allow_html=True,
-        )
+        if show_line:
+            m = _manual_metrics()
+            st.markdown(
+                _result_line_html(
+                    m["count_b"], m["tr1_b"], m["tr2_b"], m["dispo_b"],
+                    m["count_t"], m["tr1_t"], m["tr2_t"], m["dispo_t"],
+                ),
+                unsafe_allow_html=True,
+            )
 
 
 def _manual_events_last_graph_window(ref_dt: datetime) -> list[dict[str, Any]]:
@@ -163,6 +164,19 @@ def _manual_events_last_graph_window(ref_dt: datetime) -> list[dict[str, Any]]:
     out.sort(key=lambda x: x["dt"])
     return out
 
+
+
+
+@st.fragment(run_every=1)
+def _render_manual_line_fragment() -> None:
+    m = _manual_metrics()
+    st.markdown(
+        _result_line_html(
+            m["count_b"], m["tr1_b"], m["tr2_b"], m["dispo_b"],
+            m["count_t"], m["tr1_t"], m["tr2_t"], m["dispo_t"],
+        ),
+        unsafe_allow_html=True,
+    )
 
 # -----------------------------
 # Next start timer (manual mode only)
@@ -588,7 +602,8 @@ def _render_poi_modes(combined: bool) -> None:
     _ensure_poi_state()
     if combined:
         st.subheader("Mode Manuel + POI")
-        _render_manual_controls()
+        _render_manual_controls(show_line=False)
+        _render_manual_line_fragment()
         st.markdown("---")
     else:
         st.subheader("Mode POI API")
@@ -666,8 +681,6 @@ def _render_poi_modes(combined: bool) -> None:
 mode = st.radio("Mode", ["Manuel", "POI API", "Manuel + POI"], horizontal=True)
 
 if mode == "Manuel":
-    if _HAS_AUTOREFRESH:
-        st_autorefresh(interval=1000, key="manual_refresh")
     _render_manual_controls()
     st.divider()
     _render_next_start_timer()
