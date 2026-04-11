@@ -600,6 +600,8 @@ def _render_poi_fragment_body(combined: bool, time_mode: str, boat: str) -> None
 # -----------------------------
 def _render_poi_modes(combined: bool) -> None:
     _ensure_poi_state()
+    mode_key = 'combo' if combined else 'poi'
+
     if combined:
         st.subheader("Mode Manuel + POI")
         _render_manual_controls(show_line=False)
@@ -610,12 +612,19 @@ def _render_poi_modes(combined: bool) -> None:
 
     top = st.columns([1.1, 1.2, 1.4, 1.4])
     with top[0]:
-        time_mode = st.radio("Horloge", ["Live", "Faux live"] if not combined else ["Live"], horizontal=True, key=f"clock_mode_{'combo' if combined else 'poi'}")
+        st.radio(
+            "Horloge",
+            ["Live", "Faux live"] if not combined else ["Live"],
+            horizontal=True,
+            key=f"clock_mode_{mode_key}",
+        )
+    current_time_mode = st.session_state[f"clock_mode_{mode_key}"]
+
     with top[1]:
         st.session_state.poi_auto_refresh = st.toggle(
             "Auto refresh",
             value=st.session_state.poi_auto_refresh,
-            key=f"poi_auto_refresh_{'combo' if combined else 'poi'}",
+            key=f"poi_auto_refresh_{mode_key}",
         )
     with top[2]:
         refresh_s = st.number_input(
@@ -623,7 +632,7 @@ def _render_poi_modes(combined: bool) -> None:
             min_value=1,
             max_value=30,
             value=int(st.session_state.poi_refresh_seconds),
-            key=f"poi_refresh_s_{'combo' if combined else 'poi'}",
+            key=f"poi_refresh_s_{mode_key}",
         )
         refresh_s = int(refresh_s)
         if "poi_refresh_seconds_prev" not in st.session_state:
@@ -635,17 +644,18 @@ def _render_poi_modes(combined: bool) -> None:
             st.rerun()
         st.session_state.poi_refresh_seconds = refresh_s
     with top[3]:
+        boat_value = st.session_state.poi_live_boat if current_time_mode == "Live" else st.session_state.poi_fake_boat
         boat = st.text_input(
             "Boat code",
-            value=(st.session_state.poi_live_boat if time_mode == "Live" else st.session_state.poi_fake_boat),
-            key=f"boat_input_{'combo' if combined else time_mode}",
+            value=boat_value,
+            key=f"boat_input_{mode_key}_{current_time_mode}",
         )
-        if time_mode == "Live":
+        if current_time_mode == "Live":
             st.session_state.poi_live_boat = boat
         else:
             st.session_state.poi_fake_boat = boat
 
-    if time_mode == "Faux live":
+    if current_time_mode == "Faux live":
         row = st.columns([1.3, 0.9, 0.9, 1.1, 1.2])
         with row[0]:
             st.session_state.poi_fake_date = st.date_input("Date", value=st.session_state.poi_fake_date, key="poi_fake_date_input")
@@ -670,7 +680,9 @@ def _render_poi_modes(combined: bool) -> None:
 
     @st.fragment(run_every=st.session_state.poi_refresh_seconds)
     def _render_poi_fragment():
-        _render_poi_fragment_body(combined, time_mode, boat)
+        fragment_time_mode = st.session_state[f"clock_mode_{mode_key}"]
+        fragment_boat = st.session_state.poi_live_boat if fragment_time_mode == "Live" else st.session_state.poi_fake_boat
+        _render_poi_fragment_body(combined, fragment_time_mode, fragment_boat)
 
     _render_poi_fragment()
 
@@ -681,7 +693,8 @@ def _render_poi_modes(combined: bool) -> None:
 mode = st.radio("Mode", ["Manuel", "POI API", "Manuel + POI"], horizontal=True)
 
 if mode == "Manuel":
-    _render_manual_controls()
+    _render_manual_controls(show_line=False)
+    _render_manual_line_fragment()
     st.divider()
     _render_next_start_timer()
 elif mode == "POI API":
