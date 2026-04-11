@@ -3,11 +3,21 @@ import time
 from collections import deque
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from typing import Any
+import re
+
+import pandas as pd
 
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+from datetime import timezone
+def _flux_z(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 import requests
 import streamlit as st
 from dotenv import load_dotenv
+from influx_io import get_cfg, _query_data_frame_safe
 
 load_dotenv()
 SAILGP_POI_TOKEN = os.getenv("SAILGP_POI_TOKEN")
@@ -21,8 +31,7 @@ except Exception:
     st_autorefresh = None  # type: ignore
     _HAS_AUTOREFRESH = False
 
-st.set_page_config(page_title="Board cycles count", layout="wide")
-st.title("Board cycles count")
+
 
 WINDOW = 60
 GRAPH_LOOKBACK_S = 120
@@ -117,27 +126,29 @@ def _manual_metrics() -> dict[str, int]:
 
 def _render_manual_controls(show_line: bool = True) -> None:
     _ensure_manual_state()
-    c_left, c_right = st.columns([1.8, 5.2])
+    c_left, c_right = st.columns([2.5, 4.5])
     with c_left:
-        st.subheader("Babord")
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("+1 B", use_container_width=True):
-                st.session_state.press_history["babord"].append(time.time())
-        with c2:
-            if st.button("Undo B", use_container_width=True):
-                if st.session_state.press_history["babord"]:
-                    st.session_state.press_history["babord"].popleft()
-
-        st.subheader("Tribord")
-        c3, c4 = st.columns(2)
-        with c3:
-            if st.button("+1 T", use_container_width=True):
-                st.session_state.press_history["tribord"].append(time.time())
-        with c4:
-            if st.button("Undo T", use_container_width=True):
-                if st.session_state.press_history["tribord"]:
-                    st.session_state.press_history["tribord"].popleft()
+        col_b, col_t = st.columns(2)
+        with col_b:
+            st.subheader("Babord")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("+1 B", use_container_width=True):
+                    st.session_state.press_history["babord"].append(time.time())
+            with c2:
+                if st.button("Undo B", use_container_width=True):
+                    if st.session_state.press_history["babord"]:
+                        st.session_state.press_history["babord"].popleft()
+        with col_t:
+            st.subheader("Tribord")
+            c3, c4 = st.columns(2)
+            with c3:
+                if st.button("+1 T", use_container_width=True):
+                    st.session_state.press_history["tribord"].append(time.time())
+            with c4:
+                if st.button("Undo T", use_container_width=True):
+                    if st.session_state.press_history["tribord"]:
+                        st.session_state.press_history["tribord"].popleft()
 
     with c_right:
         if show_line:
@@ -281,6 +292,10 @@ def _ensure_poi_state() -> None:
         "poi_fake_boat": "ESP",
         "poi_last_tick": None,
         "poi_refresh_seconds_prev": 2,
+        "poi_show_length_graph": False,
+        "combo_show_length_graph": False,
+        "poi_show_length_debug": False,
+        "combo_show_length_debug": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -419,8 +434,21 @@ def _poi_summary(events: list[dict[str, Any]], ref_dt: datetime) -> dict[str, in
     return out
 
 
+
+
+def _downsample_df(df, step_s: int = 2):
+    try:
+        if df is None or getattr(df, "empty", True) or "time" not in df.columns:
+            return df
+        d = df.copy().sort_values("time").set_index("time")
+        d = d.resample(f"{step_s}s").last().dropna(how="all").reset_index()
+        return d
+    except Exception:
+        return df
+
 def _build_comparison_figure(ref_dt: datetime, poi_events: list[dict[str, Any]], poi_metrics: dict[str, int] | None,
-                             manual_events: list[dict[str, Any]] | None = None) -> go.Figure:
+                             manual_events: list[dict[str, Any]] | None = None,
+                             df_len: pd.DataFrame | None = None) -> go.Figure:
     x0 = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S)
     x1 = ref_dt + timedelta(seconds=GRAPH_LOOKAHEAD_S)
 
@@ -432,7 +460,7 @@ def _build_comparison_figure(ref_dt: datetime, poi_events: list[dict[str, Any]],
         "manual_t": 0.75,
     }
 
-    fig = go.Figure()
+    fig = make_subplots(specs=[[{'secondary_y': True}]])
 
     # POI traces only
     for ptype, yval in [("boardraise", lanes["raise"]), ("boarddrop", lanes["drop"])]:
@@ -446,7 +474,7 @@ def _build_comparison_figure(ref_dt: datetime, poi_events: list[dict[str, Any]],
                     marker=dict(symbol="circle", size=10, color=color),
                     name=name,
                     hovertemplate="%{x|%H:%M:%S}<extra>" + name + "</extra>",
-                ))
+                ), secondary_y=False)
 
     penalties = [e for e in poi_events if e["type"] == "boardmovepenalty" and x0 <= e["dt"] <= x1]
     if penalties:
@@ -457,7 +485,7 @@ def _build_comparison_figure(ref_dt: datetime, poi_events: list[dict[str, Any]],
             marker=dict(symbol="square", size=10, color=RED, line=dict(width=1, color="black")),
             name="POI penalty",
             hovertemplate="%{x|%H:%M:%S}<extra>POI penalty</extra>",
-        ))
+        ), secondary_y=False)
 
     # Manual overlay only in combined mode
     if manual_events is not None:
@@ -474,7 +502,7 @@ def _build_comparison_figure(ref_dt: datetime, poi_events: list[dict[str, Any]],
                     marker=dict(symbol="x", size=12, color=color, line=dict(width=2, color=color)),
                     name=name,
                     hovertemplate="%{x|%H:%M:%S}<extra>" + name + "</extra>",
-                ))
+                ), secondary_y=False)
 
     # Vertical lines
     for when, color, width in [
@@ -548,6 +576,93 @@ def _compute_ref_dt(time_mode: str) -> datetime:
     return st.session_state.poi_fake_cursor_dt
 
 
+
+
+def _load_length_db_timeseries(start_utc: datetime, stop_utc: datetime, boat: str):
+    try:
+        cfg = get_cfg()
+        dfs = []
+        for ch in ["LENGTH_DB_H_P_mm", "LENGTH_DB_H_S_mm"]:
+            boats_regex = re.escape(boat)
+            flux = f"""
+from(bucket: "{cfg.bucket}")
+  |> range(start: {_flux_z(start_utc)}, stop: {_flux_z(stop_utc)})
+  |> filter(fn: (r) => r._measurement == "{ch}")
+  |> filter(fn: (r) => r._field == "value" and r.level == "strm")
+  |> filter(fn: (r) => r.boat =~ /^{boats_regex}/)
+  |> keep(columns: ["_time", "_value", "boat"])
+  |> rename(columns: {{_time: "time", _value: "{ch}"}})
+"""
+            df = _query_data_frame_safe(cfg, flux)
+            if df is not None and not df.empty:
+                df = df.copy()
+                if "time" in df.columns:
+                    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+                dfs.append(df)
+
+        if not dfs:
+            return None
+
+        merged = None
+        for df in dfs:
+            cols = [c for c in df.columns if c != "boat"]
+            cur = df[cols].drop_duplicates()
+            if merged is None:
+                merged = cur
+            else:
+                merged = pd.merge(merged, cur, on="time", how="outer")
+
+        return merged.sort_values("time").reset_index(drop=True)
+
+    except Exception:
+        return None
+
+
+def _build_length_db_figure(df, ref_dt: datetime) -> go.Figure:
+    fig = go.Figure()
+
+    if "LENGTH_DB_H_P_mm" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df["time"],
+            y=df["LENGTH_DB_H_P_mm"],
+            mode="lines",
+            line=dict(color=RED, width=1.5),
+            name="LENGTH_DB_H_P_mm",
+        ))
+    if "LENGTH_DB_H_S_mm" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df["time"],
+            y=df["LENGTH_DB_H_S_mm"],
+            mode="lines",
+            line=dict(color=GREEN, width=1.5),
+            name="LENGTH_DB_H_S_mm",
+        ))
+
+    x0 = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S)
+    x1 = ref_dt
+
+    fig.update_xaxes(
+        range=[x0, x1],
+        tick0=x0.replace(microsecond=0),
+        dtick=10000,
+        showgrid=True,
+        gridcolor="rgba(255,255,255,0.10)",
+        tickformat="%H:%M:%S",
+        tickfont=dict(size=10),
+    )
+    fig.update_yaxes(
+        autorange=True,
+        showgrid=True,
+        gridcolor="rgba(255,255,255,0.10)",
+        tickfont=dict(size=10),
+    )
+    fig.update_layout(
+        height=190,
+        margin=dict(l=10, r=10, t=8, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=9)),
+    )
+    return fig
+
 def _render_poi_fragment_body(combined: bool, time_mode: str, boat: str) -> None:
     ref_dt = _compute_ref_dt(time_mode)
     st.caption(f"Heure de référence UTC : {ref_dt.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -566,20 +681,26 @@ def _render_poi_fragment_body(combined: bool, time_mode: str, boat: str) -> None
     else:
         manual_events = None
 
+    df_len = None
+    if st.session_state.get("combo_show_length_graph" if combined else "poi_show_length_graph", False):
+        len_start = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S)
+        len_stop = ref_dt
+        df_len = _load_length_db_timeseries(len_start, len_stop, boat)
+
     if not combined:
         st.markdown(
             _result_line_html(pm["count_b"], pm["tr1_b"], pm["tr2_b"], pm["dispo_b"], pm["count_t"], pm["tr1_t"], pm["tr2_t"], pm["dispo_t"]),
             unsafe_allow_html=True,
         )
 
-    fig = _build_comparison_figure(ref_dt, poi_events, pm, manual_events)
-    st.plotly_chart(fig, use_container_width=True)
-
     if combined:
         st.markdown(
             _result_line_html(pm["count_b"], pm["tr1_b"], pm["tr2_b"], pm["dispo_b"], pm["count_t"], pm["tr1_t"], pm["tr2_t"], pm["dispo_t"]),
             unsafe_allow_html=True,
         )
+
+    fig = _build_comparison_figure(ref_dt, poi_events, pm, manual_events, df_len=df_len)
+    st.plotly_chart(fig, use_container_width=True)
 
     if st.button("Bilan 10 min", key=f"summary_btn_{'combo' if combined else 'poi'}"):
         try:
@@ -593,6 +714,48 @@ def _render_poi_fragment_body(combined: bool, time_mode: str, boat: str) -> None
             )
         except Exception as e:
             st.error(f"Bilan 10 min impossible: {e}")
+
+    show_len_key = "combo_show_length_graph" if combined else "poi_show_length_graph"
+    debug_len_key = "combo_show_length_debug" if combined else "poi_show_length_debug"
+
+    st.session_state[show_len_key] = st.toggle(
+        "Show LENGTH_DB timeseries",
+        value=bool(st.session_state.get(show_len_key, False)),
+        key=f"{show_len_key}_toggle",
+    )
+    st.session_state[debug_len_key] = st.toggle(
+        "Debug LENGTH_DB",
+        value=bool(st.session_state.get(debug_len_key, False)),
+        key=f"{debug_len_key}_toggle",
+    )
+
+    if st.session_state.get(show_len_key, False):
+        len_start = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S)
+        len_stop = ref_dt
+        df_len = _load_length_db_timeseries(len_start, len_stop, boat)
+
+        if st.session_state.get(debug_len_key, False):
+            st.caption(
+                f"LENGTH_DB debug — boat={boat} | from={len_start.strftime('%Y-%m-%d %H:%M:%S')}Z "
+                f"| to={len_stop.strftime('%Y-%m-%d %H:%M:%S')}Z"
+            )
+            if df_len is None:
+                st.caption("LENGTH_DB debug — df_len is None")
+            elif getattr(df_len, "empty", True):
+                st.caption("LENGTH_DB debug — df_len is empty")
+            else:
+                st.caption(
+                    f"LENGTH_DB debug — rows={len(df_len)} | cols={list(df_len.columns)} | "
+                    f"first={df_len['time'].min()} | last={df_len['time'].max()}"
+                )
+                preview_cols = [c for c in ["time", "LENGTH_DB_H_P_mm", "LENGTH_DB_H_S_mm"] if c in df_len.columns]
+                st.dataframe(df_len[preview_cols].head(10), use_container_width=True)
+
+        if df_len is None or getattr(df_len, "empty", True):
+            st.caption("No LENGTH_DB data")
+        else:
+            fig_len = _build_length_db_figure(df_len, ref_dt)
+            st.plotly_chart(fig_len, use_container_width=True)
 
 
 # -----------------------------
