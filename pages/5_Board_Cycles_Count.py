@@ -8,9 +8,18 @@ import re
 import pandas as pd
 
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 from datetime import timezone
+
+def _cleanup_manual_length_clicks(ref_dt: datetime, lookback_s: int = 90) -> None:
+    cutoff = ref_dt - timedelta(seconds=lookback_s)
+    st.session_state["manual_plot_clicks_b"] = [
+        t for t in st.session_state.get("manual_plot_clicks_b", []) if t >= cutoff
+    ]
+    st.session_state["manual_plot_clicks_t"] = [
+        t for t in st.session_state.get("manual_plot_clicks_t", []) if t >= cutoff
+    ]
+
 def _flux_z(dt):
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -31,7 +40,8 @@ except Exception:
     st_autorefresh = None  # type: ignore
     _HAS_AUTOREFRESH = False
 
-
+st.set_page_config(page_title="Board cycles count", layout="wide")
+st.title("Board cycles count")
 
 WINDOW = 60
 GRAPH_LOOKBACK_S = 120
@@ -134,7 +144,9 @@ def _render_manual_controls(show_line: bool = True) -> None:
             c1, c2 = st.columns(2)
             with c1:
                 if st.button("+1 B", use_container_width=True):
-                    st.session_state.press_history["babord"].append(time.time())
+                    ts = datetime.now(timezone.utc)
+                    st.session_state.press_history["babord"].append(ts.timestamp())
+                    st.session_state.manual_plot_clicks_b.append(ts)
             with c2:
                 if st.button("Undo B", use_container_width=True):
                     if st.session_state.press_history["babord"]:
@@ -144,7 +156,9 @@ def _render_manual_controls(show_line: bool = True) -> None:
             c3, c4 = st.columns(2)
             with c3:
                 if st.button("+1 T", use_container_width=True):
-                    st.session_state.press_history["tribord"].append(time.time())
+                    ts = datetime.now(timezone.utc)
+                    st.session_state.press_history["tribord"].append(ts.timestamp())
+                    st.session_state.manual_plot_clicks_t.append(ts)
             with c4:
                 if st.button("Undo T", use_container_width=True):
                     if st.session_state.press_history["tribord"]:
@@ -296,6 +310,11 @@ def _ensure_poi_state() -> None:
         "combo_show_length_graph": False,
         "poi_show_length_debug": False,
         "combo_show_length_debug": False,
+        "manual_plot_clicks_b": [],
+        "manual_plot_clicks_t": [],
+        "manual_length_refresh_seconds": 4,
+        "manual_length_refresh_prev": 4,
+        "manual_length_boat": "FRA",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -434,21 +453,8 @@ def _poi_summary(events: list[dict[str, Any]], ref_dt: datetime) -> dict[str, in
     return out
 
 
-
-
-def _downsample_df(df, step_s: int = 2):
-    try:
-        if df is None or getattr(df, "empty", True) or "time" not in df.columns:
-            return df
-        d = df.copy().sort_values("time").set_index("time")
-        d = d.resample(f"{step_s}s").last().dropna(how="all").reset_index()
-        return d
-    except Exception:
-        return df
-
 def _build_comparison_figure(ref_dt: datetime, poi_events: list[dict[str, Any]], poi_metrics: dict[str, int] | None,
-                             manual_events: list[dict[str, Any]] | None = None,
-                             df_len: pd.DataFrame | None = None) -> go.Figure:
+                             manual_events: list[dict[str, Any]] | None = None) -> go.Figure:
     x0 = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S)
     x1 = ref_dt + timedelta(seconds=GRAPH_LOOKAHEAD_S)
 
@@ -460,7 +466,7 @@ def _build_comparison_figure(ref_dt: datetime, poi_events: list[dict[str, Any]],
         "manual_t": 0.75,
     }
 
-    fig = make_subplots(specs=[[{'secondary_y': True}]])
+    fig = go.Figure()
 
     # POI traces only
     for ptype, yval in [("boardraise", lanes["raise"]), ("boarddrop", lanes["drop"])]:
@@ -474,7 +480,7 @@ def _build_comparison_figure(ref_dt: datetime, poi_events: list[dict[str, Any]],
                     marker=dict(symbol="circle", size=10, color=color),
                     name=name,
                     hovertemplate="%{x|%H:%M:%S}<extra>" + name + "</extra>",
-                ), secondary_y=False)
+                ))
 
     penalties = [e for e in poi_events if e["type"] == "boardmovepenalty" and x0 <= e["dt"] <= x1]
     if penalties:
@@ -485,7 +491,7 @@ def _build_comparison_figure(ref_dt: datetime, poi_events: list[dict[str, Any]],
             marker=dict(symbol="square", size=10, color=RED, line=dict(width=1, color="black")),
             name="POI penalty",
             hovertemplate="%{x|%H:%M:%S}<extra>POI penalty</extra>",
-        ), secondary_y=False)
+        ))
 
     # Manual overlay only in combined mode
     if manual_events is not None:
@@ -502,7 +508,7 @@ def _build_comparison_figure(ref_dt: datetime, poi_events: list[dict[str, Any]],
                     marker=dict(symbol="x", size=12, color=color, line=dict(width=2, color=color)),
                     name=name,
                     hovertemplate="%{x|%H:%M:%S}<extra>" + name + "</extra>",
-                ), secondary_y=False)
+                ))
 
     # Vertical lines
     for when, color, width in [
@@ -529,6 +535,43 @@ def _build_comparison_figure(ref_dt: datetime, poi_events: list[dict[str, Any]],
                     fig.add_annotation(x=x, y=1.25, text=label, showarrow=False, font=dict(color=ORANGE, size=10))
 
     tick0 = x0.replace(microsecond=0)
+
+    # ===== Manual click markers (+1B / +1T) =====
+    _cleanup_manual_length_clicks(ref_dt, lookback_s=90)
+
+    xb = st.session_state.get("manual_plot_clicks_b", [])
+    xt = st.session_state.get("manual_plot_clicks_t", [])
+
+    if xb:
+        fig.add_trace(go.Scatter(
+            x=xb,
+            y=[-0.2] * len(xb),
+            mode="markers",
+            marker=dict(
+                color=RED,
+                size=8,
+                symbol="circle",
+                line=dict(color="black", width=0.5),
+            ),
+            name="+1 B",
+            hovertemplate="%{x|%H:%M:%S} UTC<extra>+1 B</extra>",
+        ))
+
+    if xt:
+        fig.add_trace(go.Scatter(
+            x=xt,
+            y=[-0.2] * len(xt),
+            mode="markers",
+            marker=dict(
+                color=GREEN,
+                size=8,
+                symbol="circle",
+                line=dict(color="black", width=0.5),
+            ),
+            name="+1 T",
+            hovertemplate="%{x|%H:%M:%S} UTC<extra>+1 T</extra>",
+        ))
+
     fig.update_xaxes(
         range=[x0, x1],
         tick0=tick0,
@@ -663,6 +706,96 @@ def _build_length_db_figure(df, ref_dt: datetime) -> go.Figure:
     )
     return fig
 
+
+
+def _build_manual_length_figure(df, ref_dt: datetime) -> go.Figure:
+    fig = go.Figure()
+
+    if "LENGTH_DB_H_P_mm" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df["time"],
+            y=-1.0 * df["LENGTH_DB_H_P_mm"],
+            mode="lines",
+            line=dict(color=RED, width=1.4),
+            name="-LENGTH_DB_H_P_mm",
+        ))
+    if "LENGTH_DB_H_S_mm" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df["time"],
+            y=-1.0 * df["LENGTH_DB_H_S_mm"],
+            mode="lines",
+            line=dict(color=GREEN, width=1.4),
+            name="-LENGTH_DB_H_S_mm",
+        ))
+
+    x0 = ref_dt - timedelta(seconds=90)
+    x1 = ref_dt
+    fig.add_vline(x=ref_dt - timedelta(minutes=1), line_color=RED, line_width=1)
+    fig.add_vline(x=ref_dt, line_color=BLUE, line_width=2)
+
+    fig.update_xaxes(
+        range=[x0, x1],
+        tick0=x0.replace(microsecond=0),
+        dtick=10000,
+        showgrid=True,
+        gridcolor="rgba(255,255,255,0.10)",
+        tickformat="%H:%M:%S",
+        tickfont=dict(size=9),
+    )
+    fig.update_yaxes(
+        autorange=True,
+        showgrid=True,
+        gridcolor="rgba(255,255,255,0.10)",
+        tickfont=dict(size=9),
+    )
+    fig.update_layout(
+        height=145,
+        margin=dict(l=10, r=10, t=6, b=8),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0, font=dict(size=8)),
+    )
+    return fig
+
+
+def _render_manual_length_mode() -> None:
+    refresh_s = int(st.session_state.manual_length_refresh_seconds)
+    if "manual_length_refresh_prev" not in st.session_state:
+        st.session_state.manual_length_refresh_prev = refresh_s
+    if refresh_s != int(st.session_state.manual_length_refresh_prev):
+        st.session_state.manual_length_refresh_prev = refresh_s
+        st.rerun()
+
+    @st.fragment(run_every=st.session_state.manual_length_refresh_seconds)
+    def _render_manual_length_fragment():
+        boat = st.session_state.manual_length_boat
+        ref_dt = datetime.now(timezone.utc)
+        start_dt = ref_dt - timedelta(seconds=90)
+        df_len = _load_length_db_timeseries(start_dt, ref_dt, boat)
+        if df_len is None or getattr(df_len, "empty", True):
+            st.caption("No LENGTH_DB data")
+        else:
+            fig_len = _build_manual_length_figure(df_len, ref_dt)
+            st.plotly_chart(fig_len, use_container_width=True)
+
+    _render_manual_length_fragment()
+
+    c1, c2 = st.columns([1.1, 1.1])
+    with c1:
+        st.session_state.manual_length_refresh_seconds = st.number_input(
+            "Refresh LENGTH_DB (s)",
+            min_value=1,
+            max_value=30,
+            value=int(st.session_state.manual_length_refresh_seconds),
+            step=1,
+            key="manual_length_refresh_seconds_input",
+        )
+    with c2:
+        st.session_state.manual_length_boat = st.text_input(
+            "Boat code LENGTH_DB",
+            value=st.session_state.manual_length_boat,
+            key="manual_length_boat_input",
+        ).strip().upper() or "FRA"
+
+
 def _render_poi_fragment_body(combined: bool, time_mode: str, boat: str) -> None:
     ref_dt = _compute_ref_dt(time_mode)
     st.caption(f"Heure de référence UTC : {ref_dt.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -681,26 +814,20 @@ def _render_poi_fragment_body(combined: bool, time_mode: str, boat: str) -> None
     else:
         manual_events = None
 
-    df_len = None
-    if st.session_state.get("combo_show_length_graph" if combined else "poi_show_length_graph", False):
-        len_start = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S)
-        len_stop = ref_dt
-        df_len = _load_length_db_timeseries(len_start, len_stop, boat)
-
     if not combined:
         st.markdown(
             _result_line_html(pm["count_b"], pm["tr1_b"], pm["tr2_b"], pm["dispo_b"], pm["count_t"], pm["tr1_t"], pm["tr2_t"], pm["dispo_t"]),
             unsafe_allow_html=True,
         )
 
+    fig = _build_comparison_figure(ref_dt, poi_events, pm, manual_events)
+    st.plotly_chart(fig, use_container_width=True)
+
     if combined:
         st.markdown(
             _result_line_html(pm["count_b"], pm["tr1_b"], pm["tr2_b"], pm["dispo_b"], pm["count_t"], pm["tr1_t"], pm["tr2_t"], pm["dispo_t"]),
             unsafe_allow_html=True,
         )
-
-    fig = _build_comparison_figure(ref_dt, poi_events, pm, manual_events, df_len=df_len)
-    st.plotly_chart(fig, use_container_width=True)
 
     if st.button("Bilan 10 min", key=f"summary_btn_{'combo' if combined else 'poi'}"):
         try:
@@ -853,7 +980,7 @@ def _render_poi_modes(combined: bool) -> None:
 # -----------------------------
 # Page body
 # -----------------------------
-mode = st.radio("Mode", ["Manuel", "POI API", "Manuel + POI"], horizontal=True)
+mode = st.radio("Mode", ["Manuel", "POI API", "Manuel + POI", "Manuel + LENGTH_DB"], horizontal=True)
 
 if mode == "Manuel":
     _render_manual_controls(show_line=False)
@@ -862,5 +989,9 @@ if mode == "Manuel":
     _render_next_start_timer()
 elif mode == "POI API":
     _render_poi_modes(combined=False)
-else:
+elif mode == "Manuel + POI":
     _render_poi_modes(combined=True)
+else:
+    _render_manual_controls(show_line=False)
+    _render_manual_line_fragment()
+    _render_manual_length_mode()
