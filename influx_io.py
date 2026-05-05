@@ -349,3 +349,67 @@ def detect_starts_from_race_start_count(df_count: pd.DataFrame) -> pd.DataFrame:
     hits = hits[["detected_time_utc", "count_before", "count_after"]].reset_index(drop=True)
     hits["start_index"] = np.arange(1, len(hits) + 1, dtype=int)
     return hits[["start_index", "detected_time_utc", "count_before", "count_after"]]
+
+
+
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def load_channels_timeseries(
+    cfg: InfluxCfg,
+    boats: list[str],
+    channels: list[str],
+    start_utc: datetime,
+    stop_utc: datetime,
+    every: str = "1s",
+    level_expr: str = "strm|mdss|mdss_fast|raw",
+    agg_fn: str = "mean",
+) -> pd.DataFrame:
+    """
+    Charge une timeseries multi-boats / multi-channels depuis Influx.
+    """
+
+    if not boats or not channels:
+        return pd.DataFrame()
+
+    boats_or = " or ".join([f'r["boat"] == "{str(b)}"' for b in boats])
+    channels_or = " or ".join([f'r["_measurement"] == "{str(ch)}"' for ch in channels])
+
+    if agg_fn not in {"mean", "last", "max", "min"}:
+        agg_fn = "mean"
+
+    flux = f'''
+from(bucket: "{cfg.bucket}")
+  |> range(start: {iso_z(start_utc)}, stop: {iso_z(stop_utc)})
+  |> filter(fn: (r) => r["_field"] == "value")
+  |> filter(fn: (r) => ({channels_or}))
+  |> filter(fn: (r) => r["level"] =~ /{level_expr}/)
+  |> filter(fn: (r) => {boats_or})
+  |> aggregateWindow(every: {every}, fn: {agg_fn}, createEmpty: false)
+  |> pivot(rowKey:["_time","boat"], columnKey:["_measurement"], valueColumn:"_value")
+  |> rename(columns: {{_time:"time_utc"}})
+'''
+
+    df = _query_data_frame_safe(cfg, flux)
+
+    if df.empty:
+        return pd.DataFrame(columns=["time_utc", "boat", *channels])
+
+    if "time_utc" not in df.columns:
+        return pd.DataFrame(columns=["time_utc", "boat", *channels])
+
+    df["time_utc"] = pd.to_datetime(df["time_utc"], utc=True, errors="coerce")
+    df["boat"] = df["boat"].astype(str)
+
+    for ch in channels:
+        if ch in df.columns:
+            df[ch] = pd.to_numeric(df[ch], errors="coerce")
+
+    keep_cols = ["time_utc", "boat"] + [ch for ch in channels if ch in df.columns]
+
+    return (
+        df[keep_cols]
+        .dropna(subset=["time_utc", "boat"])
+        .sort_values(["boat", "time_utc"])
+        .reset_index(drop=True)
+    )
