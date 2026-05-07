@@ -366,7 +366,11 @@ RIO_STOP = _utc_dt(2026, 4, 12, 18, 35, 0)
 with st.sidebar:
     st.header("Jib Trim controls")
 
-    time_mode = st.radio("Plage de temps", ["Time range", "Last X minutes"], index=0)
+    time_mode = st.radio(
+    "Plage de temps",
+    ["Time range", "Last X minutes"],
+    index=1,
+    )
 
     if time_mode == "Time range":
         st.caption("Default : Rio data test")
