@@ -48,9 +48,6 @@ FC_CHANNELS = [
 ]
 
 
-# -----------------------
-# Colors
-# -----------------------
 TEAM_COLORS = {
     "FRA": "#0064FF",
     "AUS": "#00A651",
@@ -65,6 +62,12 @@ TEAM_COLORS = {
     "ITA": "#00AEEF",
     "SUI": "#A0A0A0",
     "BRA": "#009739",
+}
+
+MODE_TITLE_COLORS = {
+    "UW": "#0064FF",
+    "DW": "#D62728",
+    "Reaching": "#FF8C00",
 }
 
 
@@ -99,9 +102,8 @@ def _add_vmg_target_pct(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _filter_data(
+def _filter_common(
     df: pd.DataFrame,
-    mode_twa: str,
     bsp_min: float,
     yaw_rate_abs_max: float,
     vmg_target_pct_min: float,
@@ -122,23 +124,44 @@ def _filter_data(
 
     out = out[_safe_num(out, "VMG_TARGET_pct") >= float(vmg_target_pct_min)]
 
-    if mode_twa != "All" and CH_TWA in out.columns:
-        twa_abs = _safe_num(out, CH_TWA).abs()
-
-        if mode_twa == "UW only":
-            out = out[(twa_abs > 35.0) & (twa_abs < 70.0)]
-
-        elif mode_twa == "DW only":
-            out = out[(twa_abs > 110.0) & (twa_abs < 165.0)]
-
     return out.reset_index(drop=True)
 
 
-def _scatter(df: pd.DataFrame, x: str, y: str, title: str, color_mode: str):
+def _filter_twa_mode(df: pd.DataFrame, mode_name: str) -> pd.DataFrame:
+    if df.empty or CH_TWA not in df.columns:
+        return pd.DataFrame(columns=df.columns)
+
+    twa_abs = _safe_num(df, CH_TWA).abs()
+
+    if mode_name == "UW":
+        return df[(twa_abs > 35.0) & (twa_abs < 70.0)].reset_index(drop=True)
+
+    if mode_name == "DW":
+        return df[(twa_abs > 115.0) & (twa_abs < 160.0)].reset_index(drop=True)
+
+    if mode_name == "Reaching":
+        return df[(twa_abs > 70.0) & (twa_abs < 115.0)].reset_index(drop=True)
+
+    return df.reset_index(drop=True)
+
+
+def _mode_title(mode_name: str, base_title: str) -> str:
+    color = MODE_TITLE_COLORS.get(mode_name, "#333333")
+    return f'<span style="color:{color};font-weight:700">{mode_name}</span> – {base_title}'
+
+
+def _scatter(
+    df: pd.DataFrame,
+    x: str,
+    y: str,
+    base_title: str,
+    mode_name: str,
+    color_mode: str,
+):
     d = df.dropna(subset=[x, y]).copy()
 
     if d.empty:
-        st.info(f"Aucune donnée disponible pour : {title}")
+        st.info(f"Aucune donnée disponible pour : {mode_name} – {base_title}")
         return
 
     hover_cols = [
@@ -152,6 +175,8 @@ def _scatter(df: pd.DataFrame, x: str, y: str, title: str, color_mode: str):
         CH_TARGET_VMG,
     ]
     hover_cols = [c for c in hover_cols if c in d.columns]
+
+    title = _mode_title(mode_name, base_title)
 
     if color_mode == "Team":
         fig = px.scatter(
@@ -179,9 +204,10 @@ def _scatter(df: pd.DataFrame, x: str, y: str, title: str, color_mode: str):
 
     fig.update_traces(marker=dict(size=7))
     fig.update_layout(
-        height=520,
+        height=500,
         margin=dict(l=20, r=20, t=55, b=20),
         legend_title_text="Team",
+        title=dict(x=0.02),
     )
 
     st.plotly_chart(fig, use_container_width=True)
@@ -246,6 +272,77 @@ def _plot_twa_bsp_timeseries(df: pd.DataFrame):
     )
 
     st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_mode_plots(
+    df_common: pd.DataFrame,
+    mode_name: str,
+    color_mode: str,
+):
+    df_mode = _filter_twa_mode(df_common, mode_name)
+
+    st.markdown(
+        f"""
+        <h2 style="color:{MODE_TITLE_COLORS.get(mode_name, '#333333')};
+                   margin-top:30px;">
+            {mode_name}
+        </h2>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if df_mode.empty:
+        st.info(f"Aucune donnée pour le mode {mode_name}.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric(f"{mode_name} points", f"{len(df_mode):,}".replace(",", " "))
+    c2.metric(f"{mode_name} TWA min", f"{_safe_num(df_mode, CH_TWA).abs().min():.1f}")
+    c3.metric(f"{mode_name} TWA max", f"{_safe_num(df_mode, CH_TWA).abs().max():.1f}")
+
+    p1, p2 = st.columns(2)
+
+    with p1:
+        _scatter(
+            df_mode,
+            x=CH_BSP,
+            y=CH_CANT_PORT,
+            base_title="Cant port vs BSP",
+            mode_name=mode_name,
+            color_mode=color_mode,
+        )
+
+    with p2:
+        _scatter(
+            df_mode,
+            x=CH_BSP,
+            y=CH_CANT_STBD,
+            base_title="Cant stbd vs BSP",
+            mode_name=mode_name,
+            color_mode=color_mode,
+        )
+
+    p3, p4 = st.columns(2)
+
+    with p3:
+        _scatter(
+            df_mode,
+            x=CH_BSP,
+            y=CH_RUDDER_AVG,
+            base_title="Rudder AVG vs BSP",
+            mode_name=mode_name,
+            color_mode=color_mode,
+        )
+
+    with p4:
+        _scatter(
+            df_mode,
+            x=CH_BSP,
+            y=CH_RIDE_HEIGHT,
+            base_title="Ride height vs BSP",
+            mode_name=mode_name,
+            color_mode=color_mode,
+        )
 
 
 # -----------------------
@@ -322,7 +419,7 @@ with st.sidebar:
             "Last X minutes",
             min_value=1,
             max_value=40,
-            value=10,
+            value=20,
             step=1,
         )
         stop_utc = datetime.now(timezone.utc)
@@ -356,20 +453,16 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("Filtres data")
 
-    mode_twa = st.radio(
-        "TWA filter",
-        ["All", "UW only", "DW only"],
-        index=0,
-    )
-
+    st.caption("Plots séparés automatiquement :")
     st.caption("UW : 35 < abs(TWA) < 70")
-    st.caption("DW : 110 < abs(TWA) < 165")
+    st.caption("Reaching : 70 < abs(TWA) < 115")
+    st.caption("DW : 115 < abs(TWA) < 160")
 
     bsp_min = st.slider(
         "BSP mini",
         min_value=0,
         max_value=80,
-        value=0,
+        value=30,
         step=1,
     )
 
@@ -377,7 +470,7 @@ with st.sidebar:
         "Yaw rate max |deg/s|",
         min_value=0,
         max_value=40,
-        value=40,
+        value=8,
         step=1,
     )
 
@@ -385,7 +478,7 @@ with st.sidebar:
         "Target VMG % min",
         min_value=0,
         max_value=120,
-        value=0,
+        value=75,
         step=1,
     )
 
@@ -416,9 +509,8 @@ if df_raw.empty:
     st.warning("Aucune donnée retournée par Influx sur cette plage.")
     st.stop()
 
-df = _filter_data(
+df_common = _filter_common(
     df_raw,
-    mode_twa=mode_twa,
     bsp_min=bsp_min,
     yaw_rate_abs_max=yaw_rate_abs_max,
     vmg_target_pct_min=vmg_target_pct_min,
@@ -426,71 +518,25 @@ df = _filter_data(
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Points bruts", f"{len(df_raw):,}".replace(",", " "))
-c2.metric("Points filtrés", f"{len(df):,}".replace(",", " "))
+c2.metric("Points filtrés", f"{len(df_common):,}".replace(",", " "))
 c3.metric("Début UTC", start_utc.strftime("%H:%M:%S"))
 c4.metric("Fin UTC", stop_utc.strftime("%H:%M:%S"))
 c5.metric("Pas", every)
 
-if df.empty:
+if df_common.empty:
     st.warning("Aucune donnée après filtres.")
     st.stop()
 
 with st.expander("Aperçu data filtrée", expanded=False):
-    st.dataframe(df.head(500), use_container_width=True)
+    st.dataframe(df_common.head(500), use_container_width=True)
 
 
 # -----------------------
-# Scatter plots
+# Plots by sailing mode
 # -----------------------
-p1, p2 = st.columns(2)
-
-with p1:
-    _scatter(
-        df,
-        x=CH_BSP,
-        y=CH_CANT_PORT,
-        title="Cant port vs BSP",
-        color_mode=color_mode,
-    )
-
-with p2:
-    _scatter(
-        df,
-        x=CH_BSP,
-        y=CH_CANT_STBD,
-        title="Cant stbd vs BSP",
-        color_mode=color_mode,
-    )
-
-p3, p4 = st.columns(2)
-
-with p3:
-    _scatter(
-        df,
-        x=CH_BSP,
-        y=CH_RUDDER_AVG,
-        title="Rudder AVG vs BSP",
-        color_mode=color_mode,
-    )
-
-with p4:
-    _scatter(
-        df,
-        x=CH_BSP,
-        y=CH_RIDE_HEIGHT,
-        title="Ride height vs BSP",
-        color_mode=color_mode,
-    )
-
-st.subheader("Rudder AVG vs TWA")
-
-_scatter(
-    df,
-    x=CH_TWA,
-    y=CH_RUDDER_AVG,
-    title="Rudder AVG vs TWA",
-    color_mode=color_mode,
-)
+_render_mode_plots(df_common, "UW", color_mode)
+_render_mode_plots(df_common, "DW", color_mode)
+_render_mode_plots(df_common, "Reaching", color_mode)
 
 
 # -----------------------
