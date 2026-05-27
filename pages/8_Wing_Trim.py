@@ -16,8 +16,8 @@ from target_utils import (
 )
 
 
-st.set_page_config(page_title="Jib Trim", layout="wide")
-st.title("Jib Trim")
+st.set_page_config(page_title="Wing Trim", layout="wide")
+st.title("Wing Trim")
 
 
 REF_BOAT = "FRA"
@@ -29,56 +29,33 @@ CH_VMG = "VMG_km_h_1"
 CH_TARGET_VMG = "TARG_VMG_km_h_1"
 CH_YAW_RATE = "RATE_YAW_deg_s_1"
 
-CH_LEEWAY = "LEEWAY_COR_deg"
-CH_JIB_LEAD = "PER_JIB_LEAD_pct"
-CH_JIB_LEAD_ANGLE = "ANGLE_JIB_SHT_deg"
-CH_JIB_SHEET_LOAD = "LOAD_JIB_SHEET_kgf"
-CH_JIB_CUNNO_LOAD = "LOAD_JIB_CUNNO_kgf"
-CH_JIB_CUNNO_PRESSURE = "PRES_JIB_CUNNO_bar"
-CH_JIB_SHEET_PRESSURE = "PRES_JIB_SHT_bar"
+CH_CA1_RAW = "ANGLE_CA1_deg"
+CH_WING_TWIST = "ANGLE_WING_TWIST_deg"
+CH_CLEW_ANGLE = "ANGLE_CLEW_deg"
 
-BTN_CHANNELS = [
-    "BTN_GD_P_FB_JIB_SHEET_IN_unk",
-    "BTN_GD_P_FB_JIB_SHEET_OUT_unk",
-    "BTN_GD_P_JIB_CUN_IN",
-    "BTN_GD_P_JIB_CUN_OUT",
-    "BTN_GD_P_JIB_LEAD_IN",
-    "BTN_GD_P_JIB_LEAD_OUT",
-    "BTN_GD_S_FB_JIB_SHEET_IN",
-    "BTN_GD_S_FB_JIB_SHEET_OUT",
-    "BTN_GD_S_JIB_CUN_IN",
-    "BTN_GD_S_JIB_CUN_OUT",
-    "BTN_GD_S_JIB_LEAD_IN",
-    "BTN_GD_S_JIB_LEAD_OUT",
-    "BTN_WT_P_FB_JIB_SHEET_IN_unk",
-    "BTN_WT_P_FB_JIB_SHEET_OUT_unk",
-    "BTN_WT_S_FB_JIB_SHEET_IN",
-    "BTN_WT_S_FB_JIB_SHEET_OUT",
-]
+COL_CA1 = "CA1"
+COL_WING_TWIST = "abs_wing_twist"
+COL_CLEW_ANGLE = "angle_clew"
 
 TARGET_COLUMNS = {
     "BSP_target": 7,
-    "jib_cunno_target": 21,
-    "jib_sheet_load_target": 23,
+    "CA1_target": 17,
+    "clew_target": 19,
+    "twist_target": 20,
 }
 
 TARGET_NAMES = list(TARGET_COLUMNS.keys())
 
-JIB_CHANNELS = [
+WING_CHANNELS = [
     CH_BSP,
     CH_TWA,
     CH_TWS,
     CH_VMG,
     CH_TARGET_VMG,
     CH_YAW_RATE,
-    CH_LEEWAY,
-    CH_JIB_LEAD,
-    CH_JIB_LEAD_ANGLE,
-    CH_JIB_SHEET_LOAD,
-    CH_JIB_CUNNO_LOAD,
-    CH_JIB_CUNNO_PRESSURE,
-    CH_JIB_SHEET_PRESSURE,
-    *BTN_CHANNELS,
+    CH_CA1_RAW,
+    CH_WING_TWIST,
+    CH_CLEW_ANGLE,
     *target_config_channels(),
 ]
 
@@ -103,9 +80,6 @@ MODE_COLORS = {
     "DW": "#D62728",
 }
 
-BUTTON_PORT_COLOR = "#D62728"
-BUTTON_STBD_COLOR = "#2CA02C"
-
 
 def _utc_dt(y: int, m: int, d: int, hh: int, mm: int, ss: int = 0) -> datetime:
     return datetime(y, m, d, hh, mm, ss, tzinfo=timezone.utc)
@@ -123,6 +97,9 @@ def _safe_num(df: pd.DataFrame, col: str) -> pd.Series:
 
 def _add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    out[COL_CA1] = pd.to_numeric(out.get(CH_CA1_RAW), errors="coerce").abs()
+    out[COL_WING_TWIST] = pd.to_numeric(out.get(CH_WING_TWIST), errors="coerce").abs()
+    out[COL_CLEW_ANGLE] = pd.to_numeric(out.get(CH_CLEW_ANGLE), errors="coerce")
 
     vmg = _safe_num(out, CH_VMG)
     target = _safe_num(out, CH_TARGET_VMG)
@@ -141,7 +118,7 @@ def _add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
 def _filter_common(df, bsp_min, yaw_rate_abs_max, vmg_target_pct_min):
     out = df.copy()
 
-    for col in JIB_CHANNELS:
+    for col in WING_CHANNELS:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
 
@@ -162,7 +139,7 @@ def _filter_mode(df, mode_name):
         return df[(twa_abs > 35.0) & (twa_abs < 70.0)].reset_index(drop=True)
 
     if mode_name == "DW":
-        return df[(twa_abs > 110.0) & (twa_abs < 165.0)].reset_index(drop=True)
+        return df[(twa_abs > 120.0) & (twa_abs < 160.0)].reset_index(drop=True)
 
     return df.reset_index(drop=True)
 
@@ -216,24 +193,38 @@ def _plot_scatter(df, x, y, title, mode_name, color_mode, target=None):
 
     if target:
         bsp_t = target.get("BSP_target", np.nan)
-        cunno_t = target.get("jib_cunno_target", np.nan)
-        sheet_load_t = target.get("jib_sheet_load_target", np.nan)
+        ca1_t = target.get("CA1_target", np.nan)
+        clew_t = target.get("clew_target", np.nan)
+        twist_t = target.get("twist_target", np.nan)
 
         if x == CH_BSP and np.isfinite(bsp_t):
             fig.add_vline(x=bsp_t, line_width=2, line_dash="dash", line_color="black")
+        if x == COL_CA1 and np.isfinite(ca1_t):
+            fig.add_vline(x=ca1_t, line_width=2, line_dash="dash", line_color="black")
+        if y == COL_CA1 and np.isfinite(ca1_t):
+            fig.add_hline(y=ca1_t, line_width=2, line_dash="dash", line_color="black")
+        if x == COL_WING_TWIST and np.isfinite(twist_t):
+            fig.add_vline(x=twist_t, line_width=2, line_dash="dash", line_color="black")
+        if y == COL_WING_TWIST and np.isfinite(twist_t):
+            fig.add_hline(y=twist_t, line_width=2, line_dash="dash", line_color="black")
+        if x == COL_CLEW_ANGLE and np.isfinite(clew_t):
+            fig.add_vline(x=clew_t, line_width=2, line_dash="dash", line_color="black")
+        if y == COL_CLEW_ANGLE and np.isfinite(clew_t):
+            fig.add_hline(y=clew_t, line_width=2, line_dash="dash", line_color="black")
 
-        if x == CH_JIB_CUNNO_LOAD and np.isfinite(cunno_t):
-            fig.add_vline(x=cunno_t, line_width=2, line_dash="dash", line_color="black")
-        if y == CH_JIB_CUNNO_LOAD and np.isfinite(cunno_t):
-            fig.add_hline(y=cunno_t, line_width=2, line_dash="dash", line_color="black")
-
-        if x == CH_JIB_SHEET_LOAD and np.isfinite(sheet_load_t):
-            fig.add_vline(x=sheet_load_t, line_width=2, line_dash="dash", line_color="black")
-        if y == CH_JIB_SHEET_LOAD and np.isfinite(sheet_load_t):
-            fig.add_hline(y=sheet_load_t, line_width=2, line_dash="dash", line_color="black")
+        if x == COL_CA1 and y == COL_WING_TWIST and np.isfinite(ca1_t) and np.isfinite(twist_t):
+            fig.add_trace(
+                go.Scatter(
+                    x=[ca1_t],
+                    y=[twist_t],
+                    mode="markers",
+                    name=f"{mode_name} target",
+                    marker=dict(size=16, color="black", symbol="x"),
+                )
+            )
 
     fig.update_traces(marker=dict(size=7), selector=dict(mode="markers"))
-    fig.update_layout(height=500, margin=dict(l=20, r=20, t=55, b=20), title=dict(x=0.02))
+    fig.update_layout(height=520, margin=dict(l=20, r=20, t=55, b=20), title=dict(x=0.02))
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -261,15 +252,15 @@ def _render_mode_section(df_common, mode_name, color_mode, target):
 
     p1, p2 = st.columns(2)
     with p1:
-        _plot_scatter(df_mode, CH_JIB_LEAD, CH_JIB_LEAD_ANGLE, "Jib lead vs jib sheet angle", mode_name, color_mode, target)
+        _plot_scatter(df_mode, COL_CA1, COL_WING_TWIST, "Abs wing twist vs CA1", mode_name, color_mode, target)
     with p2:
-        _plot_scatter(df_mode, CH_JIB_CUNNO_LOAD, CH_JIB_SHEET_LOAD, "Jib sheet load vs jib cunno load", mode_name, color_mode, target)
+        _plot_scatter(df_mode, CH_BSP, COL_CLEW_ANGLE, "Angle clew vs BSP", mode_name, color_mode, target)
 
     p3, p4 = st.columns(2)
     with p3:
-        _plot_scatter(df_mode, CH_JIB_LEAD, CH_LEEWAY, "Jib lead vs leeway", mode_name, color_mode, target)
+        _plot_scatter(df_mode, CH_BSP, COL_WING_TWIST, "Abs wing twist vs BSP", mode_name, color_mode, target)
     with p4:
-        _plot_scatter(df_mode, CH_JIB_CUNNO_PRESSURE, CH_JIB_SHEET_PRESSURE, "Pressure jib sheet vs pressure cunno", mode_name, color_mode, target)
+        _plot_scatter(df_mode, CH_BSP, COL_CA1, "CA1 vs BSP", mode_name, color_mode, target)
 
 
 def _mode_segments_for_ref(df, mode_name):
@@ -287,7 +278,7 @@ def _mode_segments_for_ref(df, mode_name):
     if mode_name == "UW":
         mask = (twa_abs > 35.0) & (twa_abs < 70.0)
     elif mode_name == "DW":
-        mask = (twa_abs > 110.0) & (twa_abs < 165.0)
+        mask = (twa_abs > 120.0) & (twa_abs < 160.0)
     else:
         return []
 
@@ -320,7 +311,7 @@ def _plot_twa_bsp_timeseries(df):
                 x0=t0,
                 x1=t1,
                 fillcolor=MODE_COLORS[mode_name],
-                opacity=0.12,
+                opacity=0.13,
                 line_width=0,
                 layer="below",
             )
@@ -329,73 +320,12 @@ def _plot_twa_bsp_timeseries(df):
     fig.add_trace(go.Scatter(x=d["time_utc"], y=d[CH_BSP], mode="lines", name="BSP km/h", yaxis="y2"))
 
     fig.update_layout(
-        title=f"TWA / BSP time series – {REF_BOAT}",
+        title=f"TWA / BSP time series – {REF_BOAT} – UW/DW windows shaded",
         height=540,
         margin=dict(l=20, r=20, t=55, b=20),
         xaxis=dict(title="Time UTC"),
         yaxis=dict(title="TWA deg", side="left"),
         yaxis2=dict(title="BSP km/h", side="right", overlaying="y", showgrid=False),
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def _plot_button_timeseries(df):
-    d = df[df["boat"].astype(str) == REF_BOAT].copy()
-
-    if d.empty:
-        st.info(f"Aucune donnée boutons disponible pour {REF_BOAT}.")
-        return
-
-    available_btns = [c for c in BTN_CHANNELS if c in d.columns]
-    if not available_btns:
-        st.info("Aucun channel BTN jib disponible.")
-        return
-
-    fig = go.Figure()
-
-    y_labels = []
-    y_values = []
-
-    for i, ch in enumerate(available_btns):
-        s = pd.to_numeric(d[ch], errors="coerce").fillna(0)
-        active = d[s > 0].copy()
-
-        if active.empty:
-            continue
-
-        y_labels.append(ch)
-        y_values.append(i)
-
-        color = BUTTON_PORT_COLOR if "_P_" in ch else BUTTON_STBD_COLOR if "_S_" in ch else "#666666"
-
-        fig.add_trace(
-            go.Scatter(
-                x=active["time_utc"],
-                y=[i] * len(active),
-                mode="markers",
-                name=ch,
-                marker=dict(size=8, color=color),
-                hovertemplate=f"{ch}<br>%{{x}}<extra></extra>",
-            )
-        )
-
-    if not fig.data:
-        st.info(f"Aucun appui BTN jib détecté pour {REF_BOAT} sur la plage.")
-        return
-
-    fig.update_layout(
-        title=f"Jib button activity – {REF_BOAT}",
-        height=max(420, 28 * len(y_labels)),
-        margin=dict(l=20, r=20, t=55, b=20),
-        xaxis=dict(title="Time UTC"),
-        yaxis=dict(
-            tickmode="array",
-            tickvals=y_values,
-            ticktext=y_labels,
-            title="BTN channels",
-        ),
-        showlegend=False,
     )
 
     st.plotly_chart(fig, use_container_width=True)
@@ -407,22 +337,22 @@ DEFAULT_START = _utc_dt(2026, 4, 12, 18, 33, 0)
 DEFAULT_STOP = _utc_dt(2026, 4, 12, 18, 35, 0)
 
 with st.sidebar:
-    st.header("Jib Trim controls")
+    st.header("Wing Trim controls")
 
     time_mode = st.radio("Plage de temps", ["Time range", "Last X minutes"], index=1)
 
     if time_mode == "Time range":
-        start_date = st.date_input("Start date UTC", value=DEFAULT_START.date(), key="jib_start_date")
-        start_time_min = st.time_input("Start time UTC", value=DEFAULT_START.time().replace(second=0), step=timedelta(minutes=1), key="jib_start_time_min")
-        start_second = st.number_input("Start seconds UTC", 0, 59, DEFAULT_START.second, key="jib_start_second")
-        stop_date = st.date_input("Stop date UTC", value=DEFAULT_STOP.date(), key="jib_stop_date")
-        stop_time_min = st.time_input("Stop time UTC", value=DEFAULT_STOP.time().replace(second=0), step=timedelta(minutes=1), key="jib_stop_time_min")
-        stop_second = st.number_input("Stop seconds UTC", 0, 59, DEFAULT_STOP.second, key="jib_stop_second")
+        start_date = st.date_input("Start date UTC", value=DEFAULT_START.date(), key="wing_start_date")
+        start_time_min = st.time_input("Start time UTC", value=DEFAULT_START.time().replace(second=0), step=timedelta(minutes=1), key="wing_start_time_min")
+        start_second = st.number_input("Start seconds UTC", 0, 59, DEFAULT_START.second, key="wing_start_second")
+        stop_date = st.date_input("Stop date UTC", value=DEFAULT_STOP.date(), key="wing_stop_date")
+        stop_time_min = st.time_input("Stop time UTC", value=DEFAULT_STOP.time().replace(second=0), step=timedelta(minutes=1), key="wing_stop_time_min")
+        stop_second = st.number_input("Stop seconds UTC", 0, 59, DEFAULT_STOP.second, key="wing_stop_second")
 
         start_utc = _combine_utc(start_date, start_time_min.replace(second=int(start_second)))
         stop_utc = _combine_utc(stop_date, stop_time_min.replace(second=int(stop_second)))
     else:
-        last_minutes = st.slider("Last X minutes", 1, 40, 10, step=1)
+        last_minutes = st.slider("Last X minutes", 1, 40, 20, step=1)
         stop_utc = datetime.now(timezone.utc)
         start_utc = stop_utc - timedelta(minutes=int(last_minutes))
 
@@ -441,26 +371,25 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("Filtres data")
     st.caption("UW : 35 < abs(TWA) < 70")
-    st.caption("DW : 110 < abs(TWA) < 165")
-
-    bsp_min = st.slider("BSP mini", 0, 80, 0, step=1)
-    yaw_rate_abs_max = st.slider("Yaw rate max |deg/s|", 0, 40, 40, step=1)
-    vmg_target_pct_min = st.slider("Target VMG % min", 0, 120, 0, step=1)
+    st.caption("DW : 120 < abs(TWA) < 160")
+    bsp_min = st.slider("BSP mini", 0, 80, 30, step=1)
+    yaw_rate_abs_max = st.slider("Yaw rate max |deg/s|", 0, 40, 8, step=1)
+    vmg_target_pct_min = st.slider("Target VMG % min", 0, 120, 75, step=1)
 
     st.markdown("---")
     color_mode = st.radio("Coloration des points", ["Team", "% VMG target"], index=0)
 
     st.markdown("---")
-    st.subheader("Targets")
-    target_source = st.radio("Source fichier targets", ["Default file", "Upload file"], index=0, key="jib_target_source")
-    uploaded_targets = st.file_uploader("Upload targets .xlsx", type=["xlsx"], key="jib_upload_targets") if target_source == "Upload file" else None
+    st.subheader("Targets aile")
+    target_source = st.radio("Source fichier targets", ["Default file", "Upload file"], index=0)
+    uploaded_targets = st.file_uploader("Upload targets .xlsx", type=["xlsx"]) if target_source == "Upload file" else None
 
 
-with st.spinner("Chargement des données Jib Trim..."):
+with st.spinner("Chargement des données Wing Trim..."):
     df_raw = load_channels_timeseries(
         cfg=cfg,
         boats=boats,
-        channels=JIB_CHANNELS,
+        channels=WING_CHANNELS,
         start_utc=start_utc,
         stop_utc=stop_utc,
         every=every,
@@ -490,7 +419,7 @@ target_result = build_targets_for_modes(
     target_columns=TARGET_COLUMNS,
     target_names=TARGET_NAMES,
     tws_mean=float(tws_fra_mean),
-    page_key="jib",
+    page_key="wing",
     modes=["UW", "DW"],
 )
 
@@ -528,7 +457,3 @@ _render_mode_section(df_common, "DW", color_mode, target_by_mode["DW"])
 st.markdown("---")
 st.subheader("Reference boat time series")
 _plot_twa_bsp_timeseries(df_raw)
-
-st.markdown("---")
-st.subheader("Jib buttons")
-_plot_button_timeseries(df_raw)

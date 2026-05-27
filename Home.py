@@ -4,7 +4,7 @@ st.set_page_config(page_title="SailGP Start Photo", layout="wide")
 st.title("SailGP – Start Photo")
 
 st.write("Choisir le mode :")
-c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
 
 with c1:
     st.subheader("Replay")
@@ -47,3 +47,9 @@ with c7:
     st.write("Analyse flight control : cant, ride height, rudder, BSP/TWA.")
     if st.button("Ouvrir FC Data"):
         st.switch_page("pages/7_FC_Data.py")
+
+with c8:
+    st.subheader("Wing Trim")
+    st.write("Analyse aile : CA1, twist, targets interpolées.")
+    if st.button("Ouvrir Wing Trim"):
+        st.switch_page("pages/8_Wing_Trim.py")
