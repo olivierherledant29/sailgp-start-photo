@@ -9,8 +9,9 @@ import pandas as pd
 import streamlit as st
 
 
-DEFAULT_TARGETS_PATH = Path("targets/Copy of Targets_S6_19mai26.xlsx")
+DEFAULT_TARGETS_PATH = Path("targets/Targets_S6_updatebeforeNY.xlsx")
 
+TARGET_COL_STATE_IDX = 0    # A
 TARGET_COL_DB_IDX = 1       # B
 TARGET_COL_RUDDER_IDX = 2   # C
 TARGET_COL_WING_IDX = 3     # D
@@ -141,6 +142,7 @@ def target_sheet_to_clean_df(
 ) -> pd.DataFrame:
     max_idx = max(
         [
+            TARGET_COL_STATE_IDX,
             TARGET_COL_DB_IDX,
             TARGET_COL_RUDDER_IDX,
             TARGET_COL_WING_IDX,
@@ -150,13 +152,22 @@ def target_sheet_to_clean_df(
         ]
     )
 
-    base_cols = ["db", "rudder", "wing_num", "config", "TWS", *target_columns.keys()]
+    base_cols = [
+        "state",
+        "db",
+        "rudder",
+        "wing_num",
+        "config",
+        "TWS",
+        *target_columns.keys(),
+    ]
 
     if df is None or df.empty or df.shape[1] <= max_idx:
         return pd.DataFrame(columns=base_cols)
 
     out = pd.DataFrame(
         {
+            "state": df.iloc[:, TARGET_COL_STATE_IDX].astype(str).str.strip(),
             "db": df.iloc[:, TARGET_COL_DB_IDX].astype(str).str.strip(),
             "rudder": df.iloc[:, TARGET_COL_RUDDER_IDX].astype(str).str.strip(),
             "wing_num": pd.to_numeric(
@@ -177,21 +188,43 @@ def target_sheet_to_clean_df(
 
     out = out.dropna(subset=["config", "TWS"])
     out = out[out["config"].str.lower().ne("nan")]
-    out = out.sort_values(["config", "TWS"]).reset_index(drop=True)
+    out = out[out["state"].str.lower().ne("nan")]
+    out = out.sort_values(["state", "config", "TWS"]).reset_index(drop=True)
     return out
+
+
+def get_available_states(clean_df: pd.DataFrame) -> list[str]:
+    if clean_df is None or clean_df.empty or "state" not in clean_df.columns:
+        return []
+
+    states = (
+        clean_df["state"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .replace("", np.nan)
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+        .tolist()
+    )
+    return states
+
+
+def filter_target_state(clean_df: pd.DataFrame, state: str | None) -> pd.DataFrame:
+    if clean_df is None or clean_df.empty or "state" not in clean_df.columns or not state:
+        return clean_df
+
+    return clean_df[
+        clean_df["state"].astype(str).str.strip().str.lower()
+        == str(state).strip().lower()
+    ].reset_index(drop=True)
 
 
 def find_default_config_from_targets(
     clean_df: pd.DataFrame,
     auto: dict,
 ) -> tuple[str | None, str]:
-    """
-    Returns (config, status)
-    status:
-    - exact: DB + rudder + wing match
-    - fallback: DB + wing match only
-    - error: no match
-    """
     if clean_df is None or clean_df.empty:
         return None, "error"
 
@@ -282,6 +315,7 @@ def build_targets_for_modes(
         "target_clean_by_mode": {m: pd.DataFrame() for m in modes},
         "selected_sheet_by_mode": {m: None for m in modes},
         "selected_config": None,
+        "selected_state": None,
         "auto_config": None,
         "auto_status": "error",
         "auto_inputs": decode_auto_config_inputs(df_raw, ref_boat),
@@ -295,7 +329,46 @@ def build_targets_for_modes(
         return result
 
     config_sheet = pick_sheet_for_mode(available_sheets, "UW") or available_sheets[0]
-    config_clean_df = target_sheet_to_clean_df(target_dict[config_sheet], target_columns)
+    config_clean_df_all_states = target_sheet_to_clean_df(
+        target_dict[config_sheet],
+        target_columns,
+    )
+
+    available_states = get_available_states(config_clean_df_all_states)
+    default_state = (
+        "Foiling"
+        if "Foiling" in available_states
+        else (available_states[0] if available_states else None)
+    )
+
+    with st.sidebar:
+        selected_state = (
+            st.selectbox(
+                "State target",
+                available_states,
+                index=available_states.index(default_state)
+                if default_state in available_states
+                else 0,
+                key=f"{page_key}_target_state",
+            )
+            if available_states
+            else None
+        )
+
+        if (
+            np.isfinite(tws_mean)
+            and tws_mean < 18
+            and selected_state
+            and selected_state.strip().lower() == "foiling"
+        ):
+            st.error(
+                "TWS moyen < 18 : les targets sont en Foiling par défaut, "
+                "mais tu peux changer le State target."
+            )
+
+    result["selected_state"] = selected_state
+
+    config_clean_df = filter_target_state(config_clean_df_all_states, selected_state)
 
     configs = sorted(config_clean_df["config"].dropna().astype(str).unique().tolist())
     auto_config, auto_status = find_default_config_from_targets(
@@ -358,7 +431,7 @@ def build_targets_for_modes(
                 )
         else:
             selected_config = None
-            st.warning("Aucune config trouvée dans le fichier targets.")
+            st.warning("Aucune config trouvée dans le fichier targets pour ce State.")
 
     result["selected_config"] = selected_config
 
@@ -368,6 +441,8 @@ def build_targets_for_modes(
             continue
 
         clean_df = target_sheet_to_clean_df(target_dict[sheet], target_columns)
+        clean_df = filter_target_state(clean_df, selected_state)
+
         result["selected_sheet_by_mode"][mode] = sheet
         result["target_clean_by_mode"][mode] = clean_df
 
