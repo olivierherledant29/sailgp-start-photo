@@ -31,7 +31,10 @@ CH_YAW_RATE = "RATE_YAW_deg_s_1"
 
 CH_LEEWAY = "LEEWAY_COR_deg"
 CH_JIB_LEAD = "PER_JIB_LEAD_pct"
+CH_JIB_SHEET_PCT = "PER_JIB_SHEET_pct"
 CH_JIB_LEAD_ANGLE = "ANGLE_JIB_SHT_deg"
+CH_AWA = "AWA_MHU_SGP_deg"
+COL_ABS_AWA = "abs_AWA"
 CH_JIB_SHEET_LOAD = "LOAD_JIB_SHEET_kgf"
 CH_JIB_CUNNO_LOAD = "LOAD_JIB_CUNNO_kgf"
 CH_JIB_CUNNO_PRESSURE = "PRES_JIB_CUNNO_bar"
@@ -60,6 +63,7 @@ TARGET_COLUMNS = {
     "BSP_target": 7,
     "jib_cunno_target": 21,
     "jib_sheet_load_target": 23,
+    "TWA_target": 8,
 }
 
 TARGET_NAMES = list(TARGET_COLUMNS.keys())
@@ -73,7 +77,9 @@ JIB_CHANNELS = [
     CH_YAW_RATE,
     CH_LEEWAY,
     CH_JIB_LEAD,
+    CH_JIB_SHEET_PCT,
     CH_JIB_LEAD_ANGLE,
+    CH_AWA,
     CH_JIB_SHEET_LOAD,
     CH_JIB_CUNNO_LOAD,
     CH_JIB_CUNNO_PRESSURE,
@@ -123,7 +129,10 @@ def _safe_num(df: pd.DataFrame, col: str) -> pd.Series:
 
 def _add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-
+    out[COL_ABS_AWA] = pd.to_numeric(
+    out.get(CH_AWA),
+    errors="coerce",
+    ).abs()
     vmg = _safe_num(out, CH_VMG)
     target = _safe_num(out, CH_TARGET_VMG)
 
@@ -167,28 +176,67 @@ def _filter_mode(df, mode_name):
     return df.reset_index(drop=True)
 
 
-def _plot_scatter(df, x, y, title, mode_name, color_mode, target=None):
+def _target_states_label(target_overlays) -> str:
+    if not target_overlays:
+        return "—"
+    return " + ".join(str(ov.get("state", "?")) for ov in target_overlays)
+
+
+def _add_target_vline(fig, x_value, color, name):
+    if np.isfinite(x_value):
+        fig.add_vline(
+            x=x_value,
+            line_width=2,
+            line_dash="dash",
+            line_color=color,
+            annotation_text=name,
+            annotation_position="top",
+        )
+
+
+def _add_target_hline(fig, y_value, color, name):
+    if np.isfinite(y_value):
+        fig.add_hline(
+            y=y_value,
+            line_width=2,
+            line_dash="dash",
+            line_color=color,
+            annotation_text=name,
+            annotation_position="right",
+        )
+
+
+def _plot_scatter(df, x, y, title, mode_name, color_mode, target_overlays=None):
     d = df.dropna(subset=[x, y]).copy()
 
     if d.empty:
         st.info(f"Aucune donnée disponible pour : {mode_name} – {title}")
         return
 
+
+
     hover_cols = [
         "time_utc",
         "boat",
         CH_BSP,
         CH_TWA,
+        CH_AWA,
+        COL_ABS_AWA,
         CH_TWS,
         CH_YAW_RATE,
         "VMG_TARGET_pct",
         CH_VMG,
         CH_TARGET_VMG,
     ]
+
     hover_cols = [c for c in hover_cols if c in d.columns]
 
     mode_color = MODE_COLORS.get(mode_name, "#333333")
-    full_title = f'<span style="color:{mode_color};font-weight:700">{mode_name}</span> – {title}'
+    target_label = _target_states_label(target_overlays)
+    full_title = (
+        f'<span style="color:{mode_color};font-weight:700">{mode_name}</span>'
+        f" – {title} | targets: {target_label}"
+    )
 
     if color_mode == "Team":
         fig = px.scatter(
@@ -214,41 +262,56 @@ def _plot_scatter(df, x, y, title, mode_name, color_mode, target=None):
         )
         fig.update_coloraxes(colorbar_title="% VMG target", cmin=0, cmax=150)
 
-    if target:
+    for overlay in target_overlays or []:
+        state = str(overlay.get("state", "target"))
+        color = overlay.get("color", "black")
+        target = overlay.get("target") or {}
+
         bsp_t = target.get("BSP_target", np.nan)
         cunno_t = target.get("jib_cunno_target", np.nan)
         sheet_load_t = target.get("jib_sheet_load_target", np.nan)
 
-        if x == CH_BSP and np.isfinite(bsp_t):
-            fig.add_vline(x=bsp_t, line_width=2, line_dash="dash", line_color="black")
+        if x == CH_BSP:
+            _add_target_vline(fig, bsp_t, color, f"{state} BSP")
 
-        if x == CH_JIB_CUNNO_LOAD and np.isfinite(cunno_t):
-            fig.add_vline(x=cunno_t, line_width=2, line_dash="dash", line_color="black")
-        if y == CH_JIB_CUNNO_LOAD and np.isfinite(cunno_t):
-            fig.add_hline(y=cunno_t, line_width=2, line_dash="dash", line_color="black")
+        if x == CH_JIB_CUNNO_LOAD:
+            _add_target_vline(fig, cunno_t, color, f"{state} cunno")
+        if y == CH_JIB_CUNNO_LOAD:
+            _add_target_hline(fig, cunno_t, color, f"{state} cunno")
 
-        if x == CH_JIB_SHEET_LOAD and np.isfinite(sheet_load_t):
-            fig.add_vline(x=sheet_load_t, line_width=2, line_dash="dash", line_color="black")
-        if y == CH_JIB_SHEET_LOAD and np.isfinite(sheet_load_t):
-            fig.add_hline(y=sheet_load_t, line_width=2, line_dash="dash", line_color="black")
+        if x == CH_JIB_SHEET_LOAD:
+            _add_target_vline(fig, sheet_load_t, color, f"{state} sheet load")
+        if y == CH_JIB_SHEET_LOAD:
+            _add_target_hline(fig, sheet_load_t, color, f"{state} sheet load")
 
     fig.update_traces(marker=dict(size=7), selector=dict(mode="markers"))
     fig.update_layout(height=500, margin=dict(l=20, r=20, t=55, b=20), title=dict(x=0.02))
     st.plotly_chart(fig, use_container_width=True)
 
+def _first_target(target_overlays):
+    if not target_overlays:
+        return None
+    return target_overlays[0].get("target")
 
-def _render_mode_section(df_common, mode_name, color_mode, target):
+
+def _render_mode_section(df_common, mode_name, color_mode, target_overlays):
     df_mode = _filter_mode(df_common, mode_name)
     mode_color = MODE_COLORS.get(mode_name, "#333333")
+    first_target = _first_target(target_overlays)
 
     st.markdown(
         f'<h2 style="color:{mode_color}; margin-top:30px;">{mode_name}</h2>',
         unsafe_allow_html=True,
     )
 
+    if target_overlays:
+        st.caption(f"Targets affichées : {_target_states_label(target_overlays)}")
+
     if df_mode.empty:
         st.info(f"Aucune donnée pour le mode {mode_name}.")
         return
+
+    df_mode_fra = df_mode[df_mode["boat"].astype(str) == REF_BOAT].copy()
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(f"{mode_name} points", f"{len(df_mode):,}".replace(",", " "))
@@ -256,21 +319,54 @@ def _render_mode_section(df_common, mode_name, color_mode, target):
     c3.metric(f"{mode_name} abs TWA max", f"{_safe_num(df_mode, CH_TWA).abs().max():.1f}")
     c4.metric(
         f"{mode_name} target BSP",
-        "—" if not target or not np.isfinite(target.get("BSP_target", np.nan)) else f"{target['BSP_target']:.1f}",
+        "—"
+        if not first_target or not np.isfinite(first_target.get("BSP_target", np.nan))
+        else f"{first_target['BSP_target']:.1f}",
     )
 
     p1, p2 = st.columns(2)
     with p1:
-        _plot_scatter(df_mode, CH_JIB_LEAD, CH_JIB_LEAD_ANGLE, "Jib lead vs jib sheet angle", mode_name, color_mode, target)
+        _plot_scatter(
+            df_mode,
+            CH_BSP,
+            CH_JIB_CUNNO_LOAD,
+            "Jib cunno load vs BSP",
+            mode_name,
+            color_mode,
+            target_overlays,
+        )
     with p2:
-        _plot_scatter(df_mode, CH_JIB_CUNNO_LOAD, CH_JIB_SHEET_LOAD, "Jib sheet load vs jib cunno load", mode_name, color_mode, target)
+        _plot_scatter(
+            df_mode,
+            CH_BSP,
+            CH_JIB_SHEET_LOAD,
+            "Jib sheet load vs BSP",
+            mode_name,
+            color_mode,
+            target_overlays,
+        )
 
     p3, p4 = st.columns(2)
     with p3:
-        _plot_scatter(df_mode, CH_JIB_LEAD, CH_LEEWAY, "Jib lead vs leeway", mode_name, color_mode, target)
+        _plot_scatter(
+            df_mode_fra,
+            CH_JIB_SHEET_PCT,
+            CH_JIB_SHEET_LOAD,
+            "FRA – Jib sheet load vs jib sheet %",
+            mode_name,
+            color_mode,
+            target_overlays,
+        )
     with p4:
-        _plot_scatter(df_mode, CH_JIB_CUNNO_PRESSURE, CH_JIB_SHEET_PRESSURE, "Pressure jib sheet vs pressure cunno", mode_name, color_mode, target)
-
+        _plot_scatter(
+            df_mode,
+            COL_ABS_AWA,
+            CH_JIB_LEAD_ANGLE,
+            "Jib lead angle vs abs(AWA)",
+            mode_name,
+            color_mode,
+            target_overlays,
+        )
 
 def _mode_segments_for_ref(df, mode_name):
     d = df[df["boat"].astype(str) == REF_BOAT].copy()
@@ -444,8 +540,8 @@ with st.sidebar:
     st.caption("DW : 110 < abs(TWA) < 165")
 
     bsp_min = st.slider("BSP mini", 0, 80, 0, step=1)
-    yaw_rate_abs_max = st.slider("Yaw rate max |deg/s|", 0, 40, 40, step=1)
-    vmg_target_pct_min = st.slider("Target VMG % min", 0, 120, 0, step=1)
+    yaw_rate_abs_max = st.slider("Yaw rate max |deg/s|", 0, 40, 8, step=1)
+    vmg_target_pct_min = st.slider("Target VMG % min", 0, 120, 50, step=1)
 
     st.markdown("---")
     color_mode = st.radio("Coloration des points", ["Team", "% VMG target"], index=0)
@@ -494,7 +590,8 @@ target_result = build_targets_for_modes(
     modes=["UW", "DW"],
 )
 
-target_by_mode = target_result["target_by_mode"]
+target_by_mode = target_result.get("target_by_mode", {"UW": None, "DW": None})
+target_overlays_by_mode = target_result.get("target_overlays_by_mode", {"UW": [], "DW": []})
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Points bruts", f"{len(df_raw):,}".replace(",", " "))
@@ -510,6 +607,9 @@ t3.metric("Auto config", target_result["auto_config"] or "—")
 t4.metric("UW BSP target", "—" if not target_by_mode["UW"] or not np.isfinite(target_by_mode["UW"].get("BSP_target", np.nan)) else f"{target_by_mode['UW']['BSP_target']:.1f}")
 t5.metric("DW BSP target", "—" if not target_by_mode["DW"] or not np.isfinite(target_by_mode["DW"].get("BSP_target", np.nan)) else f"{target_by_mode['DW']['BSP_target']:.1f}")
 
+if target_result.get("displayed_target_states"):
+    st.caption("Targets affichées : " + " + ".join(target_result["displayed_target_states"]))
+
 with st.expander("Aperçu data filtrée", expanded=False):
     st.dataframe(df_common.head(500), use_container_width=True)
 
@@ -522,8 +622,8 @@ with st.expander("Aperçu targets", expanded=False):
         else:
             st.info(f"Aucune table target chargée pour {mode_name}.")
 
-_render_mode_section(df_common, "UW", color_mode, target_by_mode["UW"])
-_render_mode_section(df_common, "DW", color_mode, target_by_mode["DW"])
+_render_mode_section(df_common, "UW", color_mode, target_overlays_by_mode["UW"])
+_render_mode_section(df_common, "DW", color_mode, target_overlays_by_mode["DW"])
 
 st.markdown("---")
 st.subheader("Reference boat time series")

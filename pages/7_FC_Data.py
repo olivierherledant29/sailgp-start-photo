@@ -32,6 +32,10 @@ CH_YAW_RATE = "RATE_YAW_deg_s_1"
 CH_CANT_PORT = "ANGLE_DB_CANT_P_deg"
 CH_CANT_STBD = "ANGLE_DB_CANT_S_deg"
 CH_RIDE_HEIGHT = "LENGTH_RH_BOW_mm"
+CH_RH_PORT = "LENGTH_RH_P_mm"
+CH_RH_STBD = "LENGTH_RH_S_mm"
+COL_RH_LEEWARD = "ride_height_leeward"
+COL_TWA_SIDE = "TWA_side"
 CH_RUDDER_AVG = "ANGLE_RUD_AVG_deg"
 CH_LEEWAY = "LEEWAY_COR_deg"
 
@@ -39,6 +43,7 @@ TARGET_COLUMNS = {
     "BSP_target": 7,
     "leeway_target": 9,
     "cant_target": 10,
+    "ride_height_leeward_target": 13,
     "rudder_avg_target": 15,
 }
 
@@ -54,6 +59,8 @@ FC_CHANNELS = [
     CH_CANT_PORT,
     CH_CANT_STBD,
     CH_RIDE_HEIGHT,
+    CH_RH_PORT,
+    CH_RH_STBD,
     CH_RUDDER_AVG,
     CH_LEEWAY,
     *target_config_channels(),
@@ -98,6 +105,13 @@ def _safe_num(df: pd.DataFrame, col: str) -> pd.Series:
 
 def _add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+
+    twa = _safe_num(out, CH_TWA)
+    rh_port = _safe_num(out, CH_RH_PORT)
+    rh_stbd = _safe_num(out, CH_RH_STBD)
+
+    out[COL_RH_LEEWARD] = np.where(twa > 0, rh_port, rh_stbd)
+    out[COL_TWA_SIDE] = np.where(twa > 0, "TWA > 0", "TWA <= 0")
 
     vmg = _safe_num(out, CH_VMG)
     target = _safe_num(out, CH_TARGET_VMG)
@@ -145,7 +159,37 @@ def _filter_mode(df, mode_name):
     return df.reset_index(drop=True)
 
 
-def _plot_scatter(df, x, y, title, mode_name, color_mode, target=None):
+def _target_states_label(target_overlays) -> str:
+    if not target_overlays:
+        return "—"
+    return " + ".join(str(ov.get("state", "?")) for ov in target_overlays)
+
+
+def _add_target_vline(fig, x_value, color, name):
+    if np.isfinite(x_value):
+        fig.add_vline(
+            x=x_value,
+            line_width=2,
+            line_dash="dash",
+            line_color=color,
+            annotation_text=name,
+            annotation_position="top",
+        )
+
+
+def _add_target_hline(fig, y_value, color, name):
+    if np.isfinite(y_value):
+        fig.add_hline(
+            y=y_value,
+            line_width=2,
+            line_dash="dash",
+            line_color=color,
+            annotation_text=name,
+            annotation_position="right",
+        )
+
+
+def _plot_scatter(df, x, y, title, mode_name, color_mode, target_overlays=None):
     d = df.dropna(subset=[x, y]).copy()
 
     if d.empty:
@@ -153,76 +197,139 @@ def _plot_scatter(df, x, y, title, mode_name, color_mode, target=None):
         return
 
     hover_cols = [
-        "time_utc",
-        "boat",
-        CH_BSP,
-        CH_TWA,
-        CH_TWS,
-        CH_YAW_RATE,
-        "VMG_TARGET_pct",
-        CH_VMG,
-        CH_TARGET_VMG,
+        "time_utc", "boat", CH_BSP, CH_TWA, CH_TWS, CH_YAW_RATE,
+        "VMG_TARGET_pct", CH_VMG, CH_TARGET_VMG,
     ]
     hover_cols = [c for c in hover_cols if c in d.columns]
 
     mode_color = MODE_COLORS.get(mode_name, "#333333")
-    full_title = f'<span style="color:{mode_color};font-weight:700">{mode_name}</span> – {title}'
+    target_label = _target_states_label(target_overlays)
+    full_title = (
+        f'<span style="color:{mode_color};font-weight:700">{mode_name}</span>'
+        f" – {title} | targets: {target_label}"
+    )
 
     if color_mode == "Team":
         fig = px.scatter(
-            d,
-            x=x,
-            y=y,
-            color="boat",
+            d, x=x, y=y, color="boat",
             color_discrete_map=TEAM_COLORS,
-            hover_data=hover_cols,
-            title=full_title,
-            opacity=0.72,
+            hover_data=hover_cols, title=full_title, opacity=0.72,
         )
     else:
         fig = px.scatter(
-            d,
-            x=x,
-            y=y,
-            color="VMG_TARGET_pct",
+            d, x=x, y=y, color="VMG_TARGET_pct",
             range_color=[0, 150],
-            hover_data=hover_cols,
-            title=full_title,
-            opacity=0.72,
+            hover_data=hover_cols, title=full_title, opacity=0.72,
         )
         fig.update_coloraxes(colorbar_title="% VMG target", cmin=0, cmax=150)
 
-    if target:
+    for overlay in target_overlays or []:
+        state = str(overlay.get("state", "target"))
+        color = overlay.get("color", "black")
+        target = overlay.get("target") or {}
+
         bsp_t = target.get("BSP_target", np.nan)
         cant_t = target.get("cant_target", np.nan)
         rud_t = target.get("rudder_avg_target", np.nan)
         leeway_t = target.get("leeway_target", np.nan)
 
-        if x == CH_BSP and np.isfinite(bsp_t):
-            fig.add_vline(x=bsp_t, line_width=2, line_dash="dash", line_color="black")
-
-        if y in [CH_CANT_PORT, CH_CANT_STBD] and np.isfinite(cant_t):
-            fig.add_hline(y=cant_t, line_width=2, line_dash="dash", line_color="black")
-
-        if y == CH_RUDDER_AVG and np.isfinite(rud_t):
-            fig.add_hline(y=rud_t, line_width=2, line_dash="dash", line_color="black")
-
-        if y == CH_LEEWAY and np.isfinite(leeway_t):
-            fig.add_hline(y=leeway_t, line_width=2, line_dash="dash", line_color="black")
+        if x == CH_BSP:
+            _add_target_vline(fig, bsp_t, color, f"{state} BSP")
+        if y in [CH_CANT_PORT, CH_CANT_STBD]:
+            _add_target_hline(fig, cant_t, color, f"{state} cant")
+        if y == CH_RUDDER_AVG:
+            _add_target_hline(fig, rud_t, color, f"{state} rudder")
+        if y == CH_LEEWAY:
+            _add_target_hline(fig, leeway_t, color, f"{state} leeway")
 
     fig.update_traces(marker=dict(size=7), selector=dict(mode="markers"))
     fig.update_layout(height=500, margin=dict(l=20, r=20, t=55, b=20), title=dict(x=0.02))
     st.plotly_chart(fig, use_container_width=True)
 
+def _plot_rh_leeward_fra(df, mode_name, target_overlays=None):
+    d = df[df["boat"].astype(str) == REF_BOAT].copy()
+    d = d.dropna(subset=[CH_BSP, COL_RH_LEEWARD, CH_TWA]).copy()
 
-def _render_mode_section(df_common, mode_name, color_mode, target):
+    if d.empty:
+        st.info(f"Aucune donnée FRA disponible pour : {mode_name} – Ride height leeward vs BSP")
+        return
+
+    d[COL_TWA_SIDE] = np.where(
+        pd.to_numeric(d[CH_TWA], errors="coerce") > 0,
+        "TWA > 0",
+        "TWA <= 0",
+    )
+
+    target_label = _target_states_label(target_overlays)
+
+    fig = px.scatter(
+        d,
+        x=CH_BSP,
+        y=COL_RH_LEEWARD,
+        color=COL_TWA_SIDE,
+        color_discrete_map={
+            "TWA > 0": "#2CA02C",
+            "TWA <= 0": "#D62728",
+        },
+        hover_data=[
+            c for c in [
+                "time_utc",
+                "boat",
+                CH_BSP,
+                CH_TWA,
+                CH_RH_PORT,
+                CH_RH_STBD,
+                COL_RH_LEEWARD,
+                "VMG_TARGET_pct",
+            ]
+            if c in d.columns
+        ],
+        title=(
+            f'<span style="color:{MODE_COLORS.get(mode_name, "#333333")};font-weight:700">'
+            f"{mode_name}</span> – FRA ride height leeward vs BSP | targets: {target_label}"
+        ),
+        opacity=0.75,
+    )
+
+    for overlay in target_overlays or []:
+        state = str(overlay.get("state", "target"))
+        color = overlay.get("color", "black")
+        target = overlay.get("target") or {}
+
+        bsp_t = target.get("BSP_target", np.nan)
+        rh_leeward_t = target.get("ride_height_leeward_target", np.nan)
+
+        _add_target_vline(fig, bsp_t, color, f"{state} BSP")
+        _add_target_hline(fig, rh_leeward_t, color, f"{state} RH leeward")
+
+    fig.update_traces(marker=dict(size=7), selector=dict(mode="markers"))
+    fig.update_layout(
+        height=500,
+        margin=dict(l=20, r=20, t=55, b=20),
+        title=dict(x=0.02),
+        legend_title_text="TWA sign",
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+def _first_target(target_overlays):
+    if not target_overlays:
+        return None
+    return target_overlays[0].get("target")
+
+
+def _render_mode_section(df_common, mode_name, color_mode, target_overlays):
     df_mode = _filter_mode(df_common, mode_name)
     mode_color = MODE_COLORS.get(mode_name, "#333333")
+    first_target = _first_target(target_overlays)
 
     st.markdown(
         f'<h2 style="color:{mode_color}; margin-top:30px;">{mode_name}</h2>',
         unsafe_allow_html=True,
     )
+
+    if target_overlays:
+        st.caption(f"Targets affichées : {_target_states_label(target_overlays)}")
 
     if df_mode.empty:
         st.info(f"Aucune donnée pour le mode {mode_name}.")
@@ -234,25 +341,27 @@ def _render_mode_section(df_common, mode_name, color_mode, target):
     c3.metric(f"{mode_name} abs TWA max", f"{_safe_num(df_mode, CH_TWA).abs().max():.1f}")
     c4.metric(
         f"{mode_name} target BSP",
-        "—" if not target or not np.isfinite(target.get("BSP_target", np.nan)) else f"{target['BSP_target']:.1f}",
+        "—" if not first_target or not np.isfinite(first_target.get("BSP_target", np.nan))
+        else f"{first_target['BSP_target']:.1f}",
     )
 
     p1, p2 = st.columns(2)
     with p1:
-        _plot_scatter(df_mode, CH_BSP, CH_CANT_PORT, "Cant port vs BSP", mode_name, color_mode, target)
+        _plot_scatter(df_mode, CH_BSP, CH_CANT_PORT, "Cant port vs BSP", mode_name, color_mode, target_overlays)
     with p2:
-        _plot_scatter(df_mode, CH_BSP, CH_CANT_STBD, "Cant stbd vs BSP", mode_name, color_mode, target)
+        _plot_scatter(df_mode, CH_BSP, CH_CANT_STBD, "Cant stbd vs BSP", mode_name, color_mode, target_overlays)
 
     p3, p4 = st.columns(2)
     with p3:
-        _plot_scatter(df_mode, CH_BSP, CH_RUDDER_AVG, "Rudder AVG vs BSP", mode_name, color_mode, target)
+        _plot_scatter(df_mode, CH_BSP, CH_RUDDER_AVG, "Rudder AVG vs BSP", mode_name, color_mode, target_overlays)
     with p4:
-        _plot_scatter(df_mode, CH_BSP, CH_RIDE_HEIGHT, "Ride height vs BSP", mode_name, color_mode, target)
+        _plot_scatter(df_mode, CH_BSP, CH_RIDE_HEIGHT, "Ride height vs BSP", mode_name, color_mode, target_overlays)
 
-    p5, _ = st.columns(2)
+    p5, p6 = st.columns(2)
     with p5:
-        _plot_scatter(df_mode, CH_BSP, CH_LEEWAY, "Leeway vs BSP", mode_name, color_mode, target)
-
+        _plot_scatter(df_mode, CH_BSP, CH_LEEWAY, "Leeway vs BSP", mode_name, color_mode, target_overlays)
+    with p6:
+        _plot_rh_leeward_fra(df_mode, mode_name, target_overlays)
 
 def _mode_segments_for_ref(df, mode_name):
     d = df[df["boat"].astype(str) == REF_BOAT].copy()
@@ -369,7 +478,7 @@ with st.sidebar:
 
     bsp_min = st.slider("BSP mini", 0, 80, 30, step=1)
     yaw_rate_abs_max = st.slider("Yaw rate max |deg/s|", 0, 40, 8, step=1)
-    vmg_target_pct_min = st.slider("Target VMG % min", 0, 120, 75, step=1)
+    vmg_target_pct_min = st.slider("Target VMG % min", 0, 120, 50, step=1)
 
     st.markdown("---")
     color_mode = st.radio("Coloration des points", ["Team", "% VMG target"], index=0)
@@ -418,7 +527,8 @@ target_result = build_targets_for_modes(
     modes=["UW", "DW", "Reaching"],
 )
 
-target_by_mode = target_result["target_by_mode"]
+target_by_mode = target_result.get("target_by_mode", {"UW": None, "DW": None, "Reaching": None})
+target_overlays_by_mode = target_result.get("target_overlays_by_mode", {"UW": [], "DW": [], "Reaching": []})
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Points bruts", f"{len(df_raw):,}".replace(",", " "))
@@ -434,6 +544,9 @@ t3.metric("Auto config", target_result["auto_config"] or "—")
 t4.metric("UW BSP target", "—" if not target_by_mode["UW"] or not np.isfinite(target_by_mode["UW"].get("BSP_target", np.nan)) else f"{target_by_mode['UW']['BSP_target']:.1f}")
 t5.metric("DW BSP target", "—" if not target_by_mode["DW"] or not np.isfinite(target_by_mode["DW"].get("BSP_target", np.nan)) else f"{target_by_mode['DW']['BSP_target']:.1f}")
 
+if target_result.get("displayed_target_states"):
+    st.caption("Targets affichées : " + " + ".join(target_result["displayed_target_states"]))
+
 with st.expander("Aperçu data filtrée", expanded=False):
     st.dataframe(df_common.head(500), use_container_width=True)
 
@@ -446,9 +559,9 @@ with st.expander("Aperçu targets", expanded=False):
         else:
             st.info(f"Aucune table target chargée pour {mode_name}.")
 
-_render_mode_section(df_common, "UW", color_mode, target_by_mode["UW"])
-_render_mode_section(df_common, "DW", color_mode, target_by_mode["DW"])
-_render_mode_section(df_common, "Reaching", color_mode, target_by_mode["Reaching"])
+_render_mode_section(df_common, "UW", color_mode, target_overlays_by_mode["UW"])
+_render_mode_section(df_common, "DW", color_mode, target_overlays_by_mode["DW"])
+_render_mode_section(df_common, "Reaching", color_mode, target_overlays_by_mode["Reaching"])
 
 st.markdown("---")
 st.subheader("Reference boat time series")

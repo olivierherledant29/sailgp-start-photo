@@ -17,6 +17,7 @@ TARGET_COL_RUDDER_IDX = 2   # C
 TARGET_COL_WING_IDX = 3     # D
 TARGET_COL_CONFIG_IDX = 4   # E
 TARGET_COL_TWS_IDX = 5      # F
+TARGET_COL_TWA_IDX = 8      # I
 
 CH_WING_CONFIG = "WING_CONFIG_unk"
 CH_DB_SEL = "MD4_SEL_DB_unk"
@@ -33,6 +34,13 @@ RUD_CONFIG_MAP = {
     2: "HSRW",
     3: "HSRW2",
 }
+
+TARGET_STATE_COLORS = {
+    "Foiling": "#ff69b4",   # rose
+    "H1": "#c49a6c",        # marron clair
+}
+
+DEFAULT_TARGET_COLOR = "#000000"
 
 
 def target_config_channels() -> list[str]:
@@ -103,6 +111,17 @@ def _norm(x) -> str:
     return s
 
 
+def _state_color(state: str | None) -> str:
+    if state is None:
+        return DEFAULT_TARGET_COLOR
+
+    for key, color in TARGET_STATE_COLORS.items():
+        if str(state).strip().lower() == key.lower():
+            return color
+
+    return DEFAULT_TARGET_COLOR
+
+
 def _first_valid_value(df: pd.DataFrame, boat: str, col: str) -> float:
     d = df[df["boat"].astype(str) == str(boat)].copy()
     if d.empty or col not in d.columns:
@@ -140,6 +159,11 @@ def target_sheet_to_clean_df(
     df: pd.DataFrame,
     target_columns: dict[str, int],
 ) -> pd.DataFrame:
+    # Force TWA_target to be available for VMG recommendation.
+    effective_target_columns = dict(target_columns)
+    if "TWA_target" not in effective_target_columns:
+        effective_target_columns["TWA_target"] = TARGET_COL_TWA_IDX
+
     max_idx = max(
         [
             TARGET_COL_STATE_IDX,
@@ -148,7 +172,7 @@ def target_sheet_to_clean_df(
             TARGET_COL_WING_IDX,
             TARGET_COL_CONFIG_IDX,
             TARGET_COL_TWS_IDX,
-            *target_columns.values(),
+            *effective_target_columns.values(),
         ]
     )
 
@@ -159,7 +183,7 @@ def target_sheet_to_clean_df(
         "wing_num",
         "config",
         "TWS",
-        *target_columns.keys(),
+        *effective_target_columns.keys(),
     ]
 
     if df is None or df.empty or df.shape[1] <= max_idx:
@@ -181,7 +205,7 @@ def target_sheet_to_clean_df(
         }
     )
 
-    for name, idx in target_columns.items():
+    for name, idx in effective_target_columns.items():
         out[name] = pd.to_numeric(df.iloc[:, idx], errors="coerce")
         if name.lower() in {"ca1_target", "twist_target"}:
             out[name] = out[name].abs()
@@ -269,10 +293,12 @@ def interp_target(
     tws_mean: float,
     target_names: list[str],
 ) -> dict:
+    names = list(dict.fromkeys([*target_names, "TWA_target"]))
+
     d = clean_df[clean_df["config"].astype(str) == str(config)].copy()
     d = d.dropna(subset=["TWS"]).sort_values("TWS")
 
-    out = {name: np.nan for name in target_names}
+    out = {name: np.nan for name in names}
     out.update({"TWS_min": np.nan, "TWS_max": np.nan})
 
     if d.empty or not np.isfinite(tws_mean):
@@ -282,7 +308,11 @@ def interp_target(
     out["TWS_min"] = float(np.nanmin(x_all))
     out["TWS_max"] = float(np.nanmax(x_all))
 
-    for col in target_names:
+    for col in names:
+        if col not in d.columns:
+            out[col] = np.nan
+            continue
+
         ydf = d[["TWS", col]].dropna()
         if len(ydf) == 0:
             out[col] = np.nan
@@ -299,6 +329,158 @@ def interp_target(
     return out
 
 
+def _vmg_from_target(target: dict) -> float:
+    bsp = target.get("BSP_target", np.nan)
+    twa = target.get("TWA_target", np.nan)
+
+    if not np.isfinite(bsp) or not np.isfinite(twa):
+        return np.nan
+
+    return float(bsp * np.cos(np.deg2rad(twa)))
+
+
+def _is_tws_inside_target_range(clean_df_state_config: pd.DataFrame, tws_mean: float) -> bool:
+    if clean_df_state_config is None or clean_df_state_config.empty:
+        return False
+
+    tws_values = pd.to_numeric(clean_df_state_config["TWS"], errors="coerce").dropna()
+    if tws_values.empty or not np.isfinite(tws_mean):
+        return False
+
+    return float(tws_values.min()) <= float(tws_mean) <= float(tws_values.max())
+
+
+def recommend_best_vmg_mode(
+    clean_df_all_states: pd.DataFrame,
+    auto_inputs: dict,
+    tws_mean: float,
+    sailing_mode: str,
+    target_names: list[str],
+) -> dict:
+    """
+    Recommends the target mode that gives the best target VMG for a given sheet/mode.
+
+    Eligibility:
+    - target mode must have rows matching DB / rudder / wing, or fallback DB / wing;
+    - TWS mean must be inside the available TWS range for that target mode/config;
+    - target must contain BSP_target and TWA_target.
+
+    Selection:
+    - UW: maximum positive VMG = BSP_target * cos(TWA_target)
+    - DW: most negative VMG
+    - Reaching/other: maximum absolute VMG by fallback convention.
+    """
+    out = {
+        "mode": None,
+        "config": None,
+        "vmg": np.nan,
+        "target": None,
+        "status": "error",
+        "eligible": [],
+    }
+
+    if clean_df_all_states is None or clean_df_all_states.empty:
+        return out
+
+    available_modes = get_available_states(clean_df_all_states)
+    if not available_modes:
+        return out
+
+    candidates = []
+
+    for target_mode in available_modes:
+        df_state = filter_target_state(clean_df_all_states, target_mode)
+        if df_state.empty:
+            continue
+
+        config, config_status = find_default_config_from_targets(df_state, auto_inputs)
+        if not config:
+            continue
+
+        df_state_config = df_state[df_state["config"].astype(str) == str(config)].copy()
+        if not _is_tws_inside_target_range(df_state_config, tws_mean):
+            continue
+
+        target = interp_target(df_state, config, float(tws_mean), target_names)
+        vmg = _vmg_from_target(target)
+
+        if not np.isfinite(vmg):
+            continue
+
+        candidates.append(
+            {
+                "mode": target_mode,
+                "config": config,
+                "config_status": config_status,
+                "vmg": float(vmg),
+                "target": target,
+                "TWS_min": target.get("TWS_min", np.nan),
+                "TWS_max": target.get("TWS_max", np.nan),
+            }
+        )
+
+    out["eligible"] = candidates
+
+    if not candidates:
+        return out
+
+    mode_upper = str(sailing_mode).upper()
+
+    if mode_upper == "UW":
+        positives = [c for c in candidates if c["vmg"] > 0]
+        pool = positives if positives else candidates
+        best = max(pool, key=lambda c: c["vmg"])
+    elif mode_upper == "DW":
+        negatives = [c for c in candidates if c["vmg"] < 0]
+        pool = negatives if negatives else candidates
+        best = min(pool, key=lambda c: c["vmg"])
+    else:
+        best = max(candidates, key=lambda c: abs(c["vmg"]))
+
+    out.update(
+        {
+            "mode": best["mode"],
+            "config": best["config"],
+            "vmg": best["vmg"],
+            "target": best["target"],
+            "status": "ok",
+        }
+    )
+    return out
+
+
+def build_single_target_overlay(
+    clean_df_all_states: pd.DataFrame,
+    selected_mode: str | None,
+    selected_config: str | None,
+    tws_mean: float,
+    target_names: list[str],
+) -> list[dict]:
+    if not selected_mode or not selected_config:
+        return []
+
+    df_mode = filter_target_state(clean_df_all_states, selected_mode)
+    if df_mode is None or df_mode.empty:
+        return []
+
+    target = interp_target(
+        df_mode,
+        selected_config,
+        float(tws_mean),
+        target_names,
+    )
+
+    return [
+        {
+            "state": selected_mode,
+            "mode": selected_mode,
+            "config": selected_config,
+            "color": _state_color(selected_mode),
+            "target": target,
+        }
+    ]
+
+
 def build_targets_for_modes(
     *,
     df_raw: pd.DataFrame,
@@ -312,10 +494,17 @@ def build_targets_for_modes(
 ) -> dict:
     result = {
         "target_by_mode": {m: None for m in modes},
+        "target_overlays_by_mode": {m: [] for m in modes},
         "target_clean_by_mode": {m: pd.DataFrame() for m in modes},
         "selected_sheet_by_mode": {m: None for m in modes},
+        "recommended_mode_by_mode": {m: None for m in modes},
+        "recommended_config_by_mode": {m: None for m in modes},
+        "recommended_vmg_by_mode": {m: np.nan for m in modes},
         "selected_config": None,
         "selected_state": None,
+        "selected_mode": None,
+        "displayed_target_states": [],
+        "displayed_target_modes": [],
         "auto_config": None,
         "auto_status": "error",
         "auto_inputs": decode_auto_config_inputs(df_raw, ref_boat),
@@ -329,46 +518,38 @@ def build_targets_for_modes(
         return result
 
     config_sheet = pick_sheet_for_mode(available_sheets, "UW") or available_sheets[0]
-    config_clean_df_all_states = target_sheet_to_clean_df(
+    config_clean_df_all_modes = target_sheet_to_clean_df(
         target_dict[config_sheet],
         target_columns,
     )
 
-    available_states = get_available_states(config_clean_df_all_states)
-    default_state = (
+    available_target_modes = get_available_states(config_clean_df_all_modes)
+    default_target_mode = (
         "Foiling"
-        if "Foiling" in available_states
-        else (available_states[0] if available_states else None)
+        if "Foiling" in available_target_modes
+        else (available_target_modes[0] if available_target_modes else None)
     )
 
     with st.sidebar:
-        selected_state = (
+        selected_target_mode = (
             st.selectbox(
-                "State target",
-                available_states,
-                index=available_states.index(default_state)
-                if default_state in available_states
+                "Mode target",
+                available_target_modes,
+                index=available_target_modes.index(default_target_mode)
+                if default_target_mode in available_target_modes
                 else 0,
-                key=f"{page_key}_target_state",
+                key=f"{page_key}_target_mode",
             )
-            if available_states
+            if available_target_modes
             else None
         )
 
-        if (
-            np.isfinite(tws_mean)
-            and tws_mean < 18
-            and selected_state
-            and selected_state.strip().lower() == "foiling"
-        ):
-            st.error(
-                "TWS moyen < 18 : les targets sont en Foiling par défaut, "
-                "mais tu peux changer le State target."
-            )
+    result["selected_state"] = selected_target_mode  # backward compatibility
+    result["selected_mode"] = selected_target_mode
+    result["displayed_target_states"] = [selected_target_mode] if selected_target_mode else []
+    result["displayed_target_modes"] = [selected_target_mode] if selected_target_mode else []
 
-    result["selected_state"] = selected_state
-
-    config_clean_df = filter_target_state(config_clean_df_all_states, selected_state)
+    config_clean_df = filter_target_state(config_clean_df_all_modes, selected_target_mode)
 
     configs = sorted(config_clean_df["config"].dropna().astype(str).unique().tolist())
     auto_config, auto_status = find_default_config_from_targets(
@@ -429,9 +610,12 @@ def build_targets_for_modes(
                     f"DB={result['auto_inputs']['db']} / "
                     f"rudder={result['auto_inputs']['rudder']}"
                 )
+
+            if selected_target_mode:
+                st.caption(f"Target affichée : {selected_target_mode}")
         else:
             selected_config = None
-            st.warning("Aucune config trouvée dans le fichier targets pour ce State.")
+            st.warning("Aucune config trouvée dans le fichier targets pour ce Mode.")
 
     result["selected_config"] = selected_config
 
@@ -440,18 +624,59 @@ def build_targets_for_modes(
         if sheet is None:
             continue
 
-        clean_df = target_sheet_to_clean_df(target_dict[sheet], target_columns)
-        clean_df = filter_target_state(clean_df, selected_state)
+        clean_df_all_modes = target_sheet_to_clean_df(target_dict[sheet], target_columns)
+        clean_df = filter_target_state(clean_df_all_modes, selected_target_mode)
 
         result["selected_sheet_by_mode"][mode] = sheet
         result["target_clean_by_mode"][mode] = clean_df
 
+        recommendation = recommend_best_vmg_mode(
+            clean_df_all_modes,
+            result["auto_inputs"],
+            float(tws_mean),
+            mode,
+            target_names,
+        )
+
+        if recommendation.get("status") == "ok":
+            result["recommended_mode_by_mode"][mode] = recommendation.get("mode")
+            result["recommended_config_by_mode"][mode] = recommendation.get("config")
+            result["recommended_vmg_by_mode"][mode] = recommendation.get("vmg")
+
         if selected_config and not clean_df.empty:
-            result["target_by_mode"][mode] = interp_target(
+            target = interp_target(
                 clean_df,
                 selected_config,
                 float(tws_mean),
                 target_names,
             )
+
+            result["target_by_mode"][mode] = target
+
+            result["target_overlays_by_mode"][mode] = build_single_target_overlay(
+                clean_df_all_modes,
+                selected_target_mode,
+                selected_config,
+                float(tws_mean),
+                target_names,
+            )
+
+    with st.sidebar:
+        warnings = []
+        for mode in modes:
+            recommended_mode = result["recommended_mode_by_mode"].get(mode)
+            recommended_vmg = result["recommended_vmg_by_mode"].get(mode)
+
+            if recommended_mode and _norm(recommended_mode) != _norm("Foiling"):
+                vmg_txt = ""
+                if np.isfinite(recommended_vmg):
+                    vmg_txt = f" — VMG target {recommended_vmg:.2f}"
+                warnings.append(
+                    f"{mode} : Foiling n'est pas le meilleur mode VMG. "
+                    f"Mode conseillé : {recommended_mode}{vmg_txt}."
+                )
+
+        if warnings:
+            st.warning("\n\n".join(warnings))
 
     return result
