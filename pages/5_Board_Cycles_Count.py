@@ -8,6 +8,7 @@ import re
 import pandas as pd
 
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from datetime import timezone
 
@@ -296,7 +297,7 @@ def _ensure_poi_state() -> None:
     defaults = {
         "poi_analysis_cache": {},
         "poi_auto_refresh": True,
-        "poi_refresh_seconds": 2,
+        "poi_refresh_seconds": 5,
         "poi_fake_date": date(2026, 3, 1),
         "poi_fake_hour": 6,
         "poi_fake_minute": 55,
@@ -305,7 +306,7 @@ def _ensure_poi_state() -> None:
         "poi_live_boat": "FRA",
         "poi_fake_boat": "ESP",
         "poi_last_tick": None,
-        "poi_refresh_seconds_prev": 2,
+        "poi_refresh_seconds_prev": 5,
         "poi_show_length_graph": False,
         "combo_show_length_graph": False,
         "poi_show_length_debug": False,
@@ -796,6 +797,130 @@ def _render_manual_length_mode() -> None:
         ).strip().upper() or "FRA"
 
 
+
+
+def _build_poi_length_figure(
+    ref_dt: datetime,
+    poi_events: list[dict[str, Any]],
+    poi_metrics: dict[str, int] | None,
+    df_len,
+) -> go.Figure:
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    x0 = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S)
+    x1 = ref_dt + timedelta(seconds=GRAPH_LOOKAHEAD_S)
+
+    for e in poi_events:
+        typ = str(e.get("type", "")).lower()
+        side = str(e.get("side") or e.get("board_side") or "").lower()
+        ts = e.get("ts") or e.get("time") or e.get("start_datetime")
+        if ts is None:
+            continue
+        if not isinstance(ts, datetime):
+            try:
+                ts = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(timezone.utc)
+            except Exception:
+                continue
+
+        if typ == "boardraise":
+            y = 1.0
+            symbol = "circle"
+        elif typ == "boarddrop":
+            y = 0.0
+            symbol = "circle"
+        elif typ == "boardmovepenalty":
+            y = -1.0
+            symbol = "square"
+        else:
+            continue
+
+        color = RED if side in ("port", "babord") else GREEN if side in ("starboard", "tribord") else "gray"
+        fig.add_trace(
+            go.Scatter(
+                x=[ts],
+                y=[y],
+                mode="markers",
+                marker=dict(color=color, size=9, symbol=symbol, line=dict(color="black", width=0.4)),
+                name=f"POI {typ} {side}".strip(),
+                showlegend=False,
+            ),
+            secondary_y=False,
+        )
+
+    if df_len is not None and not getattr(df_len, "empty", True):
+        try:
+            dfp = df_len.copy()
+            if "time" in dfp.columns:
+                dfp = dfp.sort_values("time").set_index("time").resample("2s").last().dropna(how="all").reset_index()
+            if "LENGTH_DB_H_P_mm" in dfp.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=dfp["time"],
+                        y=-(1 / 1000.0) * dfp["LENGTH_DB_H_P_mm"],
+                        mode="lines",
+                        line=dict(color=RED, width=1.2),
+                        name="-DB P (m)",
+                        opacity=0.8,
+                    ),
+                    secondary_y=True,
+                )
+            if "LENGTH_DB_H_S_mm" in dfp.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=dfp["time"],
+                        y=-(1 / 1000.0) * dfp["LENGTH_DB_H_S_mm"],
+                        mode="lines",
+                        line=dict(color=GREEN, width=1.2),
+                        name="-DB S (m)",
+                        opacity=0.8,
+                    ),
+                    secondary_y=True,
+                )
+        except Exception:
+            pass
+
+    fig.add_vline(x=ref_dt - timedelta(minutes=2), line_color=YELLOW, line_width=1)
+    fig.add_vline(x=ref_dt - timedelta(minutes=1), line_color=RED, line_width=1)
+    fig.add_vline(x=ref_dt, line_color=BLUE, line_width=2)
+
+    if poi_metrics:
+        for key, width in [("tr1_b", 1), ("tr1_t", 1), ("tr2_b", 2), ("tr2_t", 2)]:
+            val = int(poi_metrics.get(key, 0) or 0)
+            if val > 0:
+                fig.add_vline(x=ref_dt + timedelta(seconds=val), line_color="orange", line_width=width)
+
+    fig.update_xaxes(
+        range=[x0, x1],
+        tick0=x0.replace(microsecond=0),
+        dtick=10000,
+        showgrid=True,
+        gridcolor="rgba(255,255,255,0.08)",
+        tickformat="%H:%M:%S",
+        tickfont=dict(size=8),
+    )
+    fig.update_yaxes(
+        tickmode="array",
+        tickvals=[1.0, 0.0, -1.0],
+        ticktext=["Raise", "Drop", "Penalty"],
+        range=[-1.35, 1.25],
+        showgrid=False,
+        tickfont=dict(size=8),
+        secondary_y=False,
+    )
+    fig.update_yaxes(
+        autorange=True,
+        showgrid=False,
+        tickfont=dict(size=8),
+        title_text="-DB (m)",
+        secondary_y=True,
+    )
+    fig.update_layout(
+        height=245,
+        margin=dict(l=8, r=8, t=6, b=8),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0, font=dict(size=8)),
+    )
+    return fig
+
 def _render_poi_fragment_body(combined: bool, time_mode: str, boat: str) -> None:
     ref_dt = _compute_ref_dt(time_mode)
     st.caption(f"Heure de référence UTC : {ref_dt.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -980,7 +1105,60 @@ def _render_poi_modes(combined: bool) -> None:
 # -----------------------------
 # Page body
 # -----------------------------
-mode = st.radio("Mode", ["Manuel", "POI API", "Manuel + POI", "Manuel + LENGTH_DB"], horizontal=True)
+mode = st.radio("Mode", ["Manuel", "POI API", "Manuel + POI", "Manuel + LENGTH_DB", "Manuel + LENGTH_DB + POI"], horizontal=True)
+
+
+
+@st.fragment(run_every=st.session_state.get("poi_refresh_seconds", 5))
+def _render_manual_length_poi_fragment() -> None:
+    ref_dt = datetime.now(timezone.utc)
+    boat = st.session_state.get("poi_live_boat", "FRA")
+
+    try:
+        raw = _fetch_pois(
+            ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S),
+            ref_dt,
+            boat,
+            ["boarddrop", "boardraise", "boardmovepenalty"],
+        )
+        poi_events = _dedup_poi_events(_normalize_poi_events(raw))
+        pm = _poi_metrics(poi_events, ref_dt)
+    except Exception:
+        poi_events = []
+        pm = {"count_b": 0, "tr1_b": 0, "tr2_b": 0, "dispo_b": 6, "count_t": 0, "tr1_t": 0, "tr2_t": 0, "dispo_t": 6}
+
+    try:
+        df_len = _load_length_db_timeseries(ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S), ref_dt, boat)
+    except Exception:
+        df_len = None
+
+    fig = _build_poi_length_figure(ref_dt, poi_events, pm, df_len)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown(
+        _result_line_html(
+            pm["count_b"], pm["tr1_b"], pm["tr2_b"], pm["dispo_b"],
+            pm["count_t"], pm["tr1_t"], pm["tr2_t"], pm["dispo_t"],
+        ),
+        unsafe_allow_html=True,
+    )
+
+    c1, c2 = st.columns([1.2, 1.0])
+    with c1:
+        st.session_state.poi_live_boat = st.text_input(
+            "Boat code POI/LENGTH_DB",
+            value=st.session_state.get("poi_live_boat", "FRA"),
+            key="manual_len_poi_boat",
+        )
+    with c2:
+        st.session_state.poi_refresh_seconds = st.number_input(
+            "Refresh POI/LENGTH_DB (s)",
+            min_value=1,
+            max_value=30,
+            value=int(st.session_state.get("poi_refresh_seconds", 5)),
+            step=1,
+            key="manual_len_poi_refresh",
+        )
 
 if mode == "Manuel":
     _render_manual_controls(show_line=False)
@@ -991,6 +1169,12 @@ elif mode == "POI API":
     _render_poi_modes(combined=False)
 elif mode == "Manuel + POI":
     _render_poi_modes(combined=True)
+
+elif mode == "Manuel + LENGTH_DB + POI":
+    _render_manual_controls(show_line=False)
+    _render_manual_line_fragment()
+    _render_manual_length_poi_fragment()
+
 else:
     _render_manual_controls(show_line=False)
     _render_manual_line_fragment()

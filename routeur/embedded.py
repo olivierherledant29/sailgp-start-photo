@@ -20,14 +20,42 @@ from .viz import build_deck_routeur
 
 
 def _rot_xy_about(p_xy: np.ndarray, origin_xy: np.ndarray, ang_rad_ccw: float) -> np.ndarray:
-    v = p_xy - origin_xy
+    """Rotate a 2D XY point around origin, robust to NaN/inf inputs.
+
+    Returning [nan, nan] is intentional: downstream filters can drop invalid
+    route points instead of letting PyDeck fail or silently hide a whole layer.
+    """
+    p = np.asarray(p_xy, dtype=float).reshape(-1)
+    o = np.asarray(origin_xy, dtype=float).reshape(-1)
+
+    if p.size < 2 or o.size < 2:
+        return np.array([np.nan, np.nan], dtype=float)
+    if not np.all(np.isfinite(p[:2])) or not np.all(np.isfinite(o[:2])) or not np.isfinite(ang_rad_ccw):
+        return np.array([np.nan, np.nan], dtype=float)
+
+    v = p[:2] - o[:2]
     c, s = float(np.cos(ang_rad_ccw)), float(np.sin(ang_rad_ccw))
+    if not np.isfinite(c) or not np.isfinite(s):
+        return np.array([np.nan, np.nan], dtype=float)
+
     vr = np.array([c * v[0] - s * v[1], s * v[0] + c * v[1]], dtype=float)
-    return origin_xy + vr
+    return o[:2] + vr
 
 
 def _rotate_marks_xy(marks_xy: dict, origin_xy: np.ndarray, ang_rad_ccw: float) -> dict:
     return {k: _rot_xy_about(np.array(v, dtype=float), origin_xy, ang_rad_ccw) for k, v in marks_xy.items()}
+
+
+def _is_finite_xy(p) -> bool:
+    try:
+        a = np.asarray(p, dtype=float).reshape(-1)
+        return a.size >= 2 and bool(np.all(np.isfinite(a[:2])))
+    except Exception:
+        return False
+
+
+def _is_valid_lonlat(lon: float, lat: float) -> bool:
+    return np.isfinite(lon) and np.isfinite(lat) and -180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0
 
 
 def boundary_df_to_latlon(boundary_df: pd.DataFrame):
@@ -320,12 +348,19 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
             end_xy = r["p_xy"] + dd * u_to_M1
 
             p_xy_world = _rot_xy_about(np.array(r["p_xy"], dtype=float), origin_xy, -angle_rad_ccw)
+            if not _is_finite_xy(p_xy_world):
+                continue
             plat, plon = xy_to_ll(ctx["to_wgs"], float(p_xy_world[0]), float(p_xy_world[1]))
+            plon = float(plon)
+            plat = float(plat)
+            if not _is_valid_lonlat(plon, plat):
+                continue
+
             pts_ll.append(
                 dict(
                     name=f"SL_{r['x_pct']}%",
-                    lon=float(plon),
-                    lat=float(plat),
+                    lon=plon,
+                    lat=plat,
                     time_s=float(r["time_s"]),
                     dt_s=float(dt),
                     dd_m=float(dd),
@@ -341,11 +376,17 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
 
             a_w = _rot_xy_about(np.array(r["p_xy"], dtype=float), origin_xy, -angle_rad_ccw)
             b_w = _rot_xy_about(np.array(end_xy, dtype=float), origin_xy, -angle_rad_ccw)
+            if not (_is_finite_xy(a_w) and _is_finite_xy(b_w)):
+                continue
+
             alat, alon = xy_to_ll(ctx["to_wgs"], float(a_w[0]), float(a_w[1]))
             blat, blon = xy_to_ll(ctx["to_wgs"], float(b_w[0]), float(b_w[1]))
+            alon, alat, blon, blat = float(alon), float(alat), float(blon), float(blat)
+            if not (_is_valid_lonlat(alon, alat) and _is_valid_lonlat(blon, blat)):
+                continue
 
-            arrow_paths_ll.append({"path": [[float(alon), float(alat)], [float(blon), float(blat)]]})
-            vectors_ll.append({"lon0": float(alon), "lat0": float(alat), "lon1": float(blon), "lat1": float(blat)})
+            arrow_paths_ll.append({"path": [[alon, alat], [blon, blat]]})
+            vectors_ll.append({"lon0": alon, "lat0": alat, "lon1": blon, "lat1": blat})
 
         startline_overlay = {
             "SL_points": pts_ll,
@@ -527,19 +568,33 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
     def _routes_to_world(group_out: dict) -> list[dict]:
         routes = group_out.get("routes", [])
         gid = str(group_out.get("group_id", ""))
+        out_routes: list[dict] = []
 
         for r in routes:
             bt = _base_traj(r)
             r["traj"] = bt
             r["color"] = _color_for(gid, bt)
 
-            path_xy_rot = [np.array(p, dtype=float) for p in r.get("route_path_xy", [])]
-            path_xy_world = [_rot_xy_about(p, origin_xy, -angle_rad_ccw) for p in path_xy_rot]
+            raw_path = r.get("route_path_xy", [])
+            path_xy_rot = [np.array(p, dtype=float) for p in raw_path if _is_finite_xy(p)]
+
             r["route_path_ll"] = []
-            for p in path_xy_world:
-                lat, lon = xy_to_ll(ctx["to_wgs"], float(p[0]), float(p[1]))
-                r["route_path_ll"].append([lon, lat])
-        return routes
+            for p in path_xy_rot:
+                p_world = _rot_xy_about(p, origin_xy, -angle_rad_ccw)
+                if not _is_finite_xy(p_world):
+                    continue
+                lat, lon = xy_to_ll(ctx["to_wgs"], float(p_world[0]), float(p_world[1]))
+                lon = float(lon)
+                lat = float(lat)
+                if _is_valid_lonlat(lon, lat):
+                    r["route_path_ll"].append([lon, lat])
+
+            # PyDeck PathLayer needs at least 2 valid points.
+            # Keep route metadata only if the drawable geometry is valid.
+            if len(r["route_path_ll"]) >= 2:
+                out_routes.append(r)
+
+        return out_routes
 
     routes_1 = _routes_to_world(g_first_dw)
     routes_2 = _routes_to_world(g_uw_lg2) + _routes_to_world(g_uw_lg1)
