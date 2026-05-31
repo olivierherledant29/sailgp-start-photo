@@ -1109,7 +1109,7 @@ mode = st.radio("Mode", ["Manuel", "POI API", "Manuel + POI", "Manuel + LENGTH_D
 
 
 
-@st.fragment(run_every=st.session_state.get("poi_refresh_seconds", 5))
+@st.fragment(run_every=st.session_state.poi_refresh_seconds)
 def _render_manual_length_poi_fragment() -> None:
     ref_dt = datetime.now(timezone.utc)
     boat = st.session_state.get("poi_live_boat", "FRA")
@@ -1151,7 +1151,7 @@ def _render_manual_length_poi_fragment() -> None:
             key="manual_len_poi_boat",
         )
     with c2:
-        st.session_state.poi_refresh_seconds = st.number_input(
+        refresh_s = st.number_input(
             "Refresh POI/LENGTH_DB (s)",
             min_value=1,
             max_value=30,
@@ -1159,6 +1159,16 @@ def _render_manual_length_poi_fragment() -> None:
             step=1,
             key="manual_len_poi_refresh",
         )
+
+        if "poi_refresh_seconds_prev" not in st.session_state:
+            st.session_state.poi_refresh_seconds_prev = int(refresh_s)
+
+        if int(refresh_s) != int(st.session_state.poi_refresh_seconds_prev):
+            st.session_state.poi_refresh_seconds_prev = int(refresh_s)
+            st.session_state.poi_refresh_seconds = int(refresh_s)
+            st.rerun()
+
+        st.session_state.poi_refresh_seconds = int(refresh_s)
 
 if mode == "Manuel":
     _render_manual_controls(show_line=False)
