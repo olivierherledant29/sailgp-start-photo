@@ -1093,7 +1093,7 @@ def _render_poi_modes(combined: bool) -> None:
                 )
                 st.session_state.poi_last_tick = None
 
-    @st.fragment(run_every=st.session_state.poi_refresh_seconds)
+    @st.fragment(run_every=st.session_state.get("poi_refresh_seconds", 5))
     def _render_poi_fragment():
         fragment_time_mode = st.session_state[f"clock_mode_{mode_key}"]
         fragment_boat = st.session_state.poi_live_boat if fragment_time_mode == "Live" else st.session_state.poi_fake_boat
@@ -1109,7 +1109,7 @@ mode = st.radio("Mode", ["Manuel", "POI API", "Manuel + POI", "Manuel + LENGTH_D
 
 
 
-@st.fragment(run_every=st.session_state.poi_refresh_seconds)
+@st.fragment(run_every=st.session_state.get("poi_refresh_seconds", 5))
 def _render_manual_length_poi_fragment() -> None:
     ref_dt = datetime.now(timezone.utc)
     boat = st.session_state.get("poi_live_boat", "FRA")
