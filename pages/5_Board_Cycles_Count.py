@@ -135,8 +135,16 @@ def _manual_metrics() -> dict[str, int]:
     }
 
 
+
+def _ensure_manual_plot_click_state() -> None:
+    if "manual_plot_clicks_b" not in st.session_state:
+        st.session_state.manual_plot_clicks_b = []
+    if "manual_plot_clicks_t" not in st.session_state:
+        st.session_state.manual_plot_clicks_t = []
+
 def _render_manual_controls(show_line: bool = True) -> None:
     _ensure_manual_state()
+    _ensure_manual_plot_click_state()
     c_left, c_right = st.columns([2.5, 4.5])
     with c_left:
         col_b, col_t = st.columns(2)
@@ -147,11 +155,13 @@ def _render_manual_controls(show_line: bool = True) -> None:
                 if st.button("+1 B", use_container_width=True):
                     ts = datetime.now(timezone.utc)
                     st.session_state.press_history["babord"].append(ts.timestamp())
-                    st.session_state.manual_plot_clicks_b.append(ts)
+                    st.session_state.setdefault("manual_plot_clicks_b", []).append(ts)
             with c2:
                 if st.button("Undo B", use_container_width=True):
                     if st.session_state.press_history["babord"]:
                         st.session_state.press_history["babord"].popleft()
+                        if st.session_state.get("manual_plot_clicks_b"):
+                            st.session_state.manual_plot_clicks_b.pop()
         with col_t:
             st.subheader("Tribord")
             c3, c4 = st.columns(2)
@@ -159,11 +169,13 @@ def _render_manual_controls(show_line: bool = True) -> None:
                 if st.button("+1 T", use_container_width=True):
                     ts = datetime.now(timezone.utc)
                     st.session_state.press_history["tribord"].append(ts.timestamp())
-                    st.session_state.manual_plot_clicks_t.append(ts)
+                    st.session_state.setdefault("manual_plot_clicks_t", []).append(ts)
             with c4:
                 if st.button("Undo T", use_container_width=True):
                     if st.session_state.press_history["tribord"]:
                         st.session_state.press_history["tribord"].popleft()
+                        if st.session_state.get("manual_plot_clicks_t"):
+                            st.session_state.manual_plot_clicks_t.pop()
 
     with c_right:
         if show_line:
@@ -805,15 +817,60 @@ def _build_poi_length_figure(
     poi_metrics: dict[str, int] | None,
     df_len,
 ) -> go.Figure:
+    _ensure_manual_plot_click_state()
     fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-    x0 = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S)
-    x1 = ref_dt + timedelta(seconds=GRAPH_LOOKAHEAD_S)
+    x0 = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S + 10)
+    x1 = ref_dt + timedelta(seconds=10)
 
+    # --- LENGTH_DB traces first, on secondary Y
+    if df_len is not None and not getattr(df_len, "empty", True):
+        try:
+            dfp = df_len.copy()
+            if "time" in dfp.columns:
+                dfp = (
+                    dfp.sort_values("time")
+                    .set_index("time")
+                    .resample("2s")
+                    .last()
+                    .dropna(how="all")
+                    .reset_index()
+                )
+
+            if "LENGTH_DB_H_P_mm" in dfp.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=dfp["time"],
+                        y=-(1 / 1000.0) * dfp["LENGTH_DB_H_P_mm"],
+                        mode="lines",
+                        line=dict(color=RED, width=1.2),
+                        name="-DB P (m)",
+                        opacity=0.75,
+                    ),
+                    secondary_y=True,
+                )
+
+            if "LENGTH_DB_H_S_mm" in dfp.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=dfp["time"],
+                        y=-(1 / 1000.0) * dfp["LENGTH_DB_H_S_mm"],
+                        mode="lines",
+                        line=dict(color=GREEN, width=1.2),
+                        name="-DB S (m)",
+                        opacity=0.75,
+                    ),
+                    secondary_y=True,
+                )
+        except Exception:
+            pass
+
+    # --- POI markers, on primary Y
+    added_names = set()
     for e in poi_events:
         typ = str(e.get("type", "")).lower()
         side = str(e.get("side") or e.get("board_side") or "").lower()
-        ts = e.get("ts") or e.get("time") or e.get("start_datetime")
+        ts = e.get("dt") or e.get("ts") or e.get("time") or e.get("start_datetime")
         if ts is None:
             continue
         if not isinstance(ts, datetime):
@@ -825,69 +882,128 @@ def _build_poi_length_figure(
         if typ == "boardraise":
             y = 1.0
             symbol = "circle"
+            label = "POI boardraise"
         elif typ == "boarddrop":
             y = 0.0
             symbol = "circle"
+            label = "POI boarddrop"
         elif typ == "boardmovepenalty":
             y = -1.0
             symbol = "square"
+            label = "POI penalty"
         else:
             continue
 
-        color = RED if side in ("port", "babord") else GREEN if side in ("starboard", "tribord") else "gray"
+        color = RED if side in ("port", "babord") else GREEN if side in ("starboard", "tribord") else "white"
+        showlegend = label not in added_names
+        added_names.add(label)
+
         fig.add_trace(
             go.Scatter(
                 x=[ts],
                 y=[y],
                 mode="markers",
-                marker=dict(color=color, size=9, symbol=symbol, line=dict(color="black", width=0.4)),
-                name=f"POI {typ} {side}".strip(),
-                showlegend=False,
+                marker=dict(
+                    color=color,
+                    size=11,
+                    symbol=symbol,
+                    line=dict(color="black", width=0.8),
+                ),
+                name=label,
+                showlegend=showlegend,
+                hovertemplate="%{x|%H:%M:%S} UTC<extra>" + label + "</extra>",
             ),
             secondary_y=False,
         )
 
-    if df_len is not None and not getattr(df_len, "empty", True):
-        try:
-            dfp = df_len.copy()
-            if "time" in dfp.columns:
-                dfp = dfp.sort_values("time").set_index("time").resample("2s").last().dropna(how="all").reset_index()
-            if "LENGTH_DB_H_P_mm" in dfp.columns:
-                fig.add_trace(
-                    go.Scatter(
-                        x=dfp["time"],
-                        y=-(1 / 1000.0) * dfp["LENGTH_DB_H_P_mm"],
-                        mode="lines",
-                        line=dict(color=RED, width=1.2),
-                        name="-DB P (m)",
-                        opacity=0.8,
-                    ),
-                    secondary_y=True,
-                )
-            if "LENGTH_DB_H_S_mm" in dfp.columns:
-                fig.add_trace(
-                    go.Scatter(
-                        x=dfp["time"],
-                        y=-(1 / 1000.0) * dfp["LENGTH_DB_H_S_mm"],
-                        mode="lines",
-                        line=dict(color=GREEN, width=1.2),
-                        name="-DB S (m)",
-                        opacity=0.8,
-                    ),
-                    secondary_y=True,
-                )
-        except Exception:
-            pass
+    # --- Vertical reference markers on primary POI axis.
+    # Explicit Scatter traces are more robust than add_vline with secondary_y subplots.
+    y_min_marker, y_max_marker = -1.35, 1.30
 
-    fig.add_vline(x=ref_dt - timedelta(minutes=2), line_color=YELLOW, line_width=1)
-    fig.add_vline(x=ref_dt - timedelta(minutes=1), line_color=RED, line_width=1)
-    fig.add_vline(x=ref_dt, line_color=BLUE, line_width=2)
+    def _add_vertical_marker(
+        x_dt: datetime,
+        color: str,
+        width: float = 1.0,
+        dash: str | None = None,
+        name: str = "",
+    ) -> None:
+        fig.add_trace(
+            go.Scatter(
+                x=[x_dt, x_dt],
+                y=[y_min_marker, y_max_marker],
+                mode="lines",
+                line=dict(color=color, width=width, dash=dash or "solid"),
+                name=name,
+                showlegend=False,
+                hoverinfo="skip",
+            ),
+            secondary_y=False,
+        )
 
+    _add_vertical_marker(ref_dt - timedelta(minutes=2), YELLOW, 1.2, name="t-2min")
+    _add_vertical_marker(ref_dt - timedelta(minutes=1), RED, 1.2, name="t-1min")
+    _add_vertical_marker(ref_dt, BLUE, 2.2, name="now")
+
+    # --- Future bars from POI timers
     if poi_metrics:
         for key, width in [("tr1_b", 1), ("tr1_t", 1), ("tr2_b", 2), ("tr2_t", 2)]:
             val = int(poi_metrics.get(key, 0) or 0)
             if val > 0:
-                fig.add_vline(x=ref_dt + timedelta(seconds=val), line_color="orange", line_width=width)
+                _add_vertical_marker(ref_dt + timedelta(seconds=val), "orange", width, dash="dash", name=key)
+
+    # --- Manual button press markers on the POI axis, fixed top lane
+    # +1 Babord = red square, +1 Tribord = green square.
+    # They use absolute UTC timestamps, so they scroll left with the same X axis.
+    try:
+        cutoff_clicks = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S)
+        st.session_state.manual_plot_clicks_b = [
+            t for t in st.session_state.get("manual_plot_clicks_b", []) if t >= cutoff_clicks
+        ]
+        st.session_state.manual_plot_clicks_t = [
+            t for t in st.session_state.get("manual_plot_clicks_t", []) if t >= cutoff_clicks
+        ]
+
+        xb = [t for t in st.session_state.get("manual_plot_clicks_b", []) if x0 <= t <= x1]
+        xt = [t for t in st.session_state.get("manual_plot_clicks_t", []) if x0 <= t <= x1]
+        manual_click_y = 1.18
+
+        if xb:
+            fig.add_trace(
+                go.Scatter(
+                    x=xb,
+                    y=[manual_click_y] * len(xb),
+                    mode="markers",
+                    marker=dict(
+                        color=RED,
+                        size=4,
+                        symbol="square",
+                        line=dict(color="black", width=0.7),
+                    ),
+                    name="+1 BAB manual",
+                    hovertemplate="%{x|%H:%M:%S} UTC<extra>+1 BAB manual</extra>",
+                ),
+                secondary_y=False,
+            )
+
+        if xt:
+            fig.add_trace(
+                go.Scatter(
+                    x=xt,
+                    y=[manual_click_y] * len(xt),
+                    mode="markers",
+                    marker=dict(
+                        color=GREEN,
+                        size=4,
+                        symbol="square",
+                        line=dict(color="black", width=0.7),
+                    ),
+                    name="+1 TRIB manual",
+                    hovertemplate="%{x|%H:%M:%S} UTC<extra>+1 TRIB manual</extra>",
+                ),
+                secondary_y=False,
+            )
+    except Exception:
+        pass
 
     fig.update_xaxes(
         range=[x0, x1],
@@ -898,15 +1014,19 @@ def _build_poi_length_figure(
         tickformat="%H:%M:%S",
         tickfont=dict(size=8),
     )
+
+    # Primary Y is fixed so POI markers cannot disappear because of DB autoscale.
     fig.update_yaxes(
         tickmode="array",
         tickvals=[1.0, 0.0, -1.0],
         ticktext=["Raise", "Drop", "Penalty"],
-        range=[-1.35, 1.25],
+        range=[-1.35, 1.30],
         showgrid=False,
         tickfont=dict(size=8),
         secondary_y=False,
     )
+
+    # Secondary Y is auto for -DB curves.
     fig.update_yaxes(
         autorange=True,
         showgrid=False,
@@ -914,6 +1034,7 @@ def _build_poi_length_figure(
         title_text="-DB (m)",
         secondary_y=True,
     )
+
     fig.update_layout(
         height=245,
         margin=dict(l=8, r=8, t=6, b=8),
@@ -1021,59 +1142,6 @@ def _render_poi_modes(combined: bool) -> None:
         st.subheader("Mode Manuel + POI")
         _render_manual_controls(show_line=False)
         _render_manual_line_fragment()
-        st.markdown("---")
-    else:
-        st.subheader("Mode POI API")
-
-    top = st.columns([1.1, 1.2, 1.4, 1.4])
-    with top[0]:
-        st.radio(
-            "Horloge",
-            ["Live", "Faux live"] if not combined else ["Live"],
-            horizontal=True,
-            key=f"clock_mode_{mode_key}",
-        )
-    current_time_mode = st.session_state[f"clock_mode_{mode_key}"]
-
-    with top[1]:
-        st.session_state.poi_auto_refresh = st.toggle(
-            "Auto refresh",
-            value=st.session_state.poi_auto_refresh,
-            key=f"poi_auto_refresh_{mode_key}",
-        )
-    with top[2]:
-        refresh_s = st.number_input(
-            "Refresh (s)",
-            min_value=1,
-            max_value=30,
-            value=int(st.session_state.poi_refresh_seconds),
-            key=f"poi_refresh_s_{mode_key}",
-        )
-        refresh_s = int(refresh_s)
-        if "poi_refresh_seconds_prev" not in st.session_state:
-            st.session_state.poi_refresh_seconds_prev = refresh_s
-        if refresh_s != int(st.session_state.poi_refresh_seconds_prev):
-            st.session_state.poi_refresh_seconds_prev = refresh_s
-            st.session_state.poi_refresh_seconds = refresh_s
-            st.session_state.poi_last_tick = None
-            st.rerun()
-        st.session_state.poi_refresh_seconds = refresh_s
-    with top[3]:
-        boat_value = st.session_state.poi_live_boat if current_time_mode == "Live" else st.session_state.poi_fake_boat
-        boat = st.text_input(
-            "Boat code",
-            value=boat_value,
-            key=f"boat_input_{mode_key}_{current_time_mode}",
-        )
-        if current_time_mode == "Live":
-            st.session_state.poi_live_boat = boat
-        else:
-            st.session_state.poi_fake_boat = boat
-
-    if current_time_mode == "Faux live":
-        row = st.columns([1.3, 0.9, 0.9, 1.1, 1.2])
-        with row[0]:
-            st.session_state.poi_fake_date = st.date_input("Date", value=st.session_state.poi_fake_date, key="poi_fake_date_input")
         with row[1]:
             st.session_state.poi_fake_hour = st.number_input("Heure UTC", 0, 23, int(st.session_state.poi_fake_hour), key="poi_fake_hour_input")
         with row[2]:
