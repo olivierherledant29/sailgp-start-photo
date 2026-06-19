@@ -142,34 +142,52 @@ def _ensure_manual_plot_click_state() -> None:
     if "manual_plot_clicks_t" not in st.session_state:
         st.session_state.manual_plot_clicks_t = []
 
+
+
 def _render_manual_controls(show_line: bool = True) -> None:
     _ensure_manual_state()
     _ensure_manual_plot_click_state()
+
     c_left, c_right = st.columns([2.5, 4.5])
+
     with c_left:
         col_b, col_t = st.columns(2)
+
         with col_b:
             st.subheader("Babord")
-            c1, c2 = st.columns(2)
+
+            # Streamlit Cloud récent refuse columns > 1 niveau de nesting.
+            # Ici on est déjà dans col_b, lui-même dans c_left.
+            # Donc on utilise deux containers verticaux au lieu de st.columns(2).
+            c1 = st.container()
+            c2 = st.container()
+
             with c1:
                 if st.button("+1 B", use_container_width=True):
                     ts = datetime.now(timezone.utc)
                     st.session_state.press_history["babord"].append(ts.timestamp())
                     st.session_state.setdefault("manual_plot_clicks_b", []).append(ts)
+
             with c2:
                 if st.button("Undo B", use_container_width=True):
                     if st.session_state.press_history["babord"]:
                         st.session_state.press_history["babord"].popleft()
                         if st.session_state.get("manual_plot_clicks_b"):
                             st.session_state.manual_plot_clicks_b.pop()
+
         with col_t:
             st.subheader("Tribord")
-            c3, c4 = st.columns(2)
+
+            # Même correction : pas de 3e niveau de st.columns.
+            c3 = st.container()
+            c4 = st.container()
+
             with c3:
                 if st.button("+1 T", use_container_width=True):
                     ts = datetime.now(timezone.utc)
                     st.session_state.press_history["tribord"].append(ts.timestamp())
                     st.session_state.setdefault("manual_plot_clicks_t", []).append(ts)
+
             with c4:
                 if st.button("Undo T", use_container_width=True):
                     if st.session_state.press_history["tribord"]:
