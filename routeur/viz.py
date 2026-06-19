@@ -15,6 +15,101 @@ from .geo import (
 )
 
 
+# ============================================================
+# PyDeck / Streamlit Cloud defensive helpers
+# ============================================================
+def _is_valid_lonlat_pair(p) -> bool:
+    try:
+        if p is None or len(p) != 2:
+            return False
+        lon = float(p[0])
+        lat = float(p[1])
+        return bool(np.isfinite(lon) and np.isfinite(lat) and -180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0)
+    except Exception:
+        return False
+
+
+def _sanitize_lonlat_path(path, *, max_points: int = 900):
+    """Return a PyDeck-safe [[lon, lat], ...] path."""
+    if not path:
+        return []
+    clean = []
+    for p in path:
+        if _is_valid_lonlat_pair(p):
+            clean.append([float(p[0]), float(p[1])])
+    if len(clean) < 2:
+        return []
+    if max_points is not None and max_points > 2 and len(clean) > max_points:
+        step = max(1, int(np.ceil(len(clean) / float(max_points))))
+        ds = clean[::step]
+        if ds[-1] != clean[-1]:
+            ds.append(clean[-1])
+        clean = ds
+    return clean
+
+
+def _sanitize_path_records(records, *, key: str = "path", max_points: int = 900):
+    out = []
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        path = _sanitize_lonlat_path(rec.get(key), max_points=max_points)
+        if len(path) >= 2:
+            new = dict(rec)
+            new[key] = path
+            out.append(new)
+    return out
+
+
+def _sanitize_lonlat_points(records):
+    out = []
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        try:
+            lon = float(rec.get("lon"))
+            lat = float(rec.get("lat"))
+        except Exception:
+            continue
+        if _is_valid_lonlat_pair([lon, lat]):
+            new = dict(rec)
+            new["lon"] = lon
+            new["lat"] = lat
+            out.append(new)
+    return out
+
+
+def _sanitize_lonlat_vectors(records):
+    out = []
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        try:
+            lon0, lat0 = float(rec.get("lon0")), float(rec.get("lat0"))
+            lon1, lat1 = float(rec.get("lon1")), float(rec.get("lat1"))
+        except Exception:
+            continue
+        if _is_valid_lonlat_pair([lon0, lat0]) and _is_valid_lonlat_pair([lon1, lat1]):
+            new = dict(rec)
+            new.update({"lon0": lon0, "lat0": lat0, "lon1": lon1, "lat1": lat1})
+            out.append(new)
+    return out
+
+
+def _fade_rgb(rgb, alpha: float = 0.35):
+    """Blend an RGB color toward white for no-current background routes."""
+    try:
+        r, g, b = [int(x) for x in rgb[:3]]
+    except Exception:
+        r, g, b = 255, 255, 255
+    a = max(0.0, min(1.0, float(alpha)))
+    return [
+        int(255 * (1 - a) + r * a),
+        int(255 * (1 - a) + g * a),
+        int(255 * (1 - a) + b * a),
+    ]
+
+
 def build_deck(ctx, geom, PI_xy, out):
     to_utm, to_wgs = ctx["to_utm"], ctx["to_wgs"]
     centroid_lat, centroid_lon = ctx["centroid_lat"], ctx["centroid_lon"]
@@ -241,7 +336,12 @@ def build_deck(ctx, geom, PI_xy, out):
         bearing=bearing,
     )
 
-    return pdk.Deck(layers=layers, initial_view_state=view_state, tooltip={"text": "{name}"})
+    return pdk.Deck(
+        layers=layers,
+        initial_view_state=view_state,
+        tooltip={"text": "{name}"},
+        map_style=pdk.map_styles.DARK,
+    )
 
 
 # ============================
@@ -304,9 +404,25 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
     # Routes
     route_layers = []
     for r in (route_out.get("routes") or []):
-        path_ll = r.get("route_path_ll", None)
-        if path_ll and len(path_ll) >= 2:
-            color = r.get("color", [255, 255, 255])
+        color = r.get("color", [255, 255, 255])
+
+        # Optional no-current reference route, rendered first and faded.
+        path_ll_nocurrent = _sanitize_lonlat_path(r.get("route_path_ll_nocurrent", None), max_points=700)
+        if len(path_ll_nocurrent) >= 2:
+            route_layers.append(
+                pdk.Layer(
+                    "PathLayer",
+                    data=[{"path": path_ll_nocurrent}],
+                    get_path="path",
+                    width_scale=5,
+                    width_min_pixels=2,
+                    get_color=_fade_rgb(color, alpha=0.30),
+                    pickable=False,
+                )
+            )
+
+        path_ll = _sanitize_lonlat_path(r.get("route_path_ll", None), max_points=900)
+        if len(path_ll) >= 2:
             route_layers.append(
                 pdk.Layer(
                     "PathLayer",
@@ -315,6 +431,7 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
                     width_scale=8,
                     width_min_pixels=4,
                     get_color=color,
+                    pickable=True,
                 )
             )
 
@@ -358,9 +475,9 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
 
     # ✅ Start-line overlay (points + arrows)
     overlay = route_out.get("startline_overlay") if isinstance(route_out, dict) else None
-    overlay_points = overlay.get("SL_points", []) if overlay else []
-    overlay_arrow_paths = overlay.get("SL_arrow_paths", []) if overlay else []  # NEW
-    overlay_vectors = overlay.get("SL_vectors", []) if overlay else []         # compat
+    overlay_points = _sanitize_lonlat_points(overlay.get("SL_points", []) if overlay else [])
+    overlay_arrow_paths = _sanitize_path_records(overlay.get("SL_arrow_paths", []) if overlay else [], max_points=60)
+    overlay_vectors = _sanitize_lonlat_vectors(overlay.get("SL_vectors", []) if overlay else [])
 
     layers = []
 
@@ -504,4 +621,9 @@ def build_deck_routeur(ctx, geom, marks_ll: dict, marks_xy: dict, route_out: dic
         pitch=0,
         bearing=bearing,
     )
-    return pdk.Deck(layers=layers, initial_view_state=view_state, tooltip={"text": "{name}"})
+    return pdk.Deck(
+        layers=layers,
+        initial_view_state=view_state,
+        tooltip={"text": "{name}"},
+        map_style=pdk.map_styles.DARK,
+    )

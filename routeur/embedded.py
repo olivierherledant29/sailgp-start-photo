@@ -227,6 +227,20 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
         )
         st.session_state["offset_TWS"] = int(offset_TWS)
 
+        st.markdown("---")
+        cloud_safe_mode = st.checkbox(
+            "Mode compatibilité Streamlit Cloud",
+            value=bool(st.session_state.get("cloud_safe_mode", True)),
+            help="Nettoie/downsample les paths et limite les overlays susceptibles de faire planter deck.gl sur Streamlit Cloud.",
+        )
+        st.session_state["cloud_safe_mode"] = bool(cloud_safe_mode)
+
+        debug_routeur_cloud = st.checkbox(
+            "Debug rendu routeur",
+            value=bool(st.session_state.get("debug_routeur_cloud", False)),
+        )
+        st.session_state["debug_routeur_cloud"] = bool(debug_routeur_cloud)
+
     TWD = (float(TWD_base) + float(offset_TWD)) % 360.0
     TWS_ref_kmh = float(max(0.0, float(TWS_base) + float(offset_TWS)))
 
@@ -599,6 +613,27 @@ def render_routeur_simplifie(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
     routes_1 = _routes_to_world(g_first_dw)
     routes_2 = _routes_to_world(g_uw_lg2) + _routes_to_world(g_uw_lg1)
     routes_3 = _routes_to_world(g_dw_wg2) + _routes_to_world(g_dw_wg1)
+
+    # Streamlit Cloud / deck.gl can be less tolerant than local for very dense
+    # First DW overlays. Keep the data, but cap the start-line overlay payload in
+    # compatibility mode. The actual routes are sanitized/downsampled in viz.py.
+    cloud_safe_mode = bool(st.session_state.get("cloud_safe_mode", True))
+    debug_routeur_cloud = bool(st.session_state.get("debug_routeur_cloud", False))
+
+    if startline_overlay is not None and cloud_safe_mode:
+        startline_overlay = dict(startline_overlay)
+        startline_overlay["SL_arrow_paths"] = list(startline_overlay.get("SL_arrow_paths", []))[:11]
+        startline_overlay["SL_vectors"] = list(startline_overlay.get("SL_vectors", []))[:11]
+        startline_overlay["SL_points"] = list(startline_overlay.get("SL_points", []))[:11]
+
+    if debug_routeur_cloud:
+        st.caption(
+            "DEBUG First DW — "
+            f"routes={len(routes_1)} ; "
+            f"route_points={[len(r.get('route_path_ll', [])) for r in routes_1]} ; "
+            f"overlay_points={len(startline_overlay.get('SL_points', [])) if startline_overlay else 0} ; "
+            f"overlay_arrows={len(startline_overlay.get('SL_arrow_paths', [])) if startline_overlay else 0}"
+        )
 
     out1 = {**biases, "TWD": float(TWD), "routes": routes_1, "vmg_info": []}
     if startline_overlay is not None:
