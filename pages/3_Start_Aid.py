@@ -19,6 +19,14 @@ deck, out = render_start_aid(
 )
 
 if deck is not None:
-    st.pydeck_chart(deck, width="stretch")
+    st.pydeck_chart(
+        deck,
+        width=1200,
+        height=700,
+    )
+
     if out and out.get("results_html"):
-        st.markdown(out["results_html"], unsafe_allow_html=True)
+        st.markdown(
+            out["results_html"],
+            unsafe_allow_html=True,
+        )
