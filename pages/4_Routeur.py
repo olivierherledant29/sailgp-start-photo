@@ -1,4 +1,14 @@
+import subprocess
 import streamlit as st
+
+try:
+    sha = subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"],
+        text=True
+    ).strip()
+    st.sidebar.write(f"Git SHA: {sha}")
+except Exception as e:
+    st.sidebar.write(f"Git SHA unavailable: {e}")
 
 from boundary_shared import sidebar_boundary_uploader
 from routeur.embedded import render_routeur_simplifie
