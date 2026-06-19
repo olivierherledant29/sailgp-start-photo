@@ -26,14 +26,17 @@ def _render_vmg_info(out: dict):
         )
 
 
+MAP_WIDTH = 1200
+MAP_HEIGHT = 700
+
 st.subheader("First DW from M1")
-st.pydeck_chart(decks["deck1"], use_container_width=True)
+st.pydeck_chart(decks["deck1"], width=MAP_WIDTH, height=MAP_HEIGHT)
 _render_vmg_info(outs.get("out1", {}))
 
 st.subheader("FULL UPWIND")
-st.pydeck_chart(decks["deck2"], use_container_width=True)
+st.pydeck_chart(decks["deck2"], width=MAP_WIDTH, height=MAP_HEIGHT)
 _render_vmg_info(outs.get("out2", {}))
 
 st.subheader("FULL DOWNWIND")
-st.pydeck_chart(decks["deck3"], use_container_width=True)
+st.pydeck_chart(decks["deck3"], width=MAP_WIDTH, height=MAP_HEIGHT)
 _render_vmg_info(outs.get("out3", {}))
