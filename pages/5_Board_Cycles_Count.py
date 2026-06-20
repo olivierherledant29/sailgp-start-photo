@@ -346,6 +346,13 @@ def _ensure_poi_state() -> None:
         "manual_length_refresh_seconds": 4,
         "manual_length_refresh_prev": 4,
         "manual_length_boat": "FRA",
+        "manual_len_poi_time_mode": "Live",
+        "manual_len_poi_fake_date": date(2026, 6, 20),
+        "manual_len_poi_fake_hour": 19,
+        "manual_len_poi_fake_minute": 6,
+        "manual_len_poi_fake_play": False,
+        "manual_len_poi_fake_cursor_dt": datetime(2026, 6, 20, 19, 6, 0, tzinfo=timezone.utc),
+        "manual_len_poi_last_tick": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1154,18 +1161,93 @@ def _render_poi_fragment_body(combined: bool, time_mode: str, boat: str) -> None
 # -----------------------------
 def _render_poi_modes(combined: bool) -> None:
     _ensure_poi_state()
-    mode_key = 'combo' if combined else 'poi'
+    mode_key = "combo" if combined else "poi"
 
     if combined:
         st.subheader("Mode Manuel + POI")
         _render_manual_controls(show_line=False)
         _render_manual_line_fragment()
+        st.markdown("---")
+    else:
+        st.subheader("Mode POI API")
+
+    top = st.columns([1.1, 1.2, 1.4, 1.4])
+    with top[0]:
+        st.radio(
+            "Horloge",
+            ["Live"] if combined else ["Live", "Faux live"],
+            horizontal=True,
+            key=f"clock_mode_{mode_key}",
+        )
+    current_time_mode = st.session_state[f"clock_mode_{mode_key}"]
+
+    with top[1]:
+        st.session_state.poi_auto_refresh = st.toggle(
+            "Auto refresh",
+            value=st.session_state.poi_auto_refresh,
+            key=f"poi_auto_refresh_{mode_key}",
+        )
+
+    with top[2]:
+        refresh_s = st.number_input(
+            "Refresh (s)",
+            min_value=1,
+            max_value=30,
+            value=int(st.session_state.poi_refresh_seconds),
+            key=f"poi_refresh_s_{mode_key}",
+        )
+        refresh_s = int(refresh_s)
+        if "poi_refresh_seconds_prev" not in st.session_state:
+            st.session_state.poi_refresh_seconds_prev = refresh_s
+        if refresh_s != int(st.session_state.poi_refresh_seconds_prev):
+            st.session_state.poi_refresh_seconds_prev = refresh_s
+            st.session_state.poi_refresh_seconds = refresh_s
+            st.session_state.poi_last_tick = None
+            st.rerun()
+        st.session_state.poi_refresh_seconds = refresh_s
+
+    with top[3]:
+        boat_value = st.session_state.poi_live_boat if current_time_mode == "Live" else st.session_state.poi_fake_boat
+        boat = st.text_input(
+            "Boat code",
+            value=boat_value,
+            key=f"boat_input_{mode_key}_{current_time_mode}",
+        ).strip().upper() or "FRA"
+        if current_time_mode == "Live":
+            st.session_state.poi_live_boat = boat
+        else:
+            st.session_state.poi_fake_boat = boat
+
+    if current_time_mode == "Faux live":
+        row = st.columns([1.3, 0.9, 0.9, 1.1, 1.2])
+        with row[0]:
+            st.session_state.poi_fake_date = st.date_input(
+                "Date",
+                value=st.session_state.poi_fake_date,
+                key="poi_fake_date_input",
+            )
         with row[1]:
-            st.session_state.poi_fake_hour = st.number_input("Heure UTC", 0, 23, int(st.session_state.poi_fake_hour), key="poi_fake_hour_input")
+            st.session_state.poi_fake_hour = st.number_input(
+                "Heure UTC",
+                0,
+                23,
+                int(st.session_state.poi_fake_hour),
+                key="poi_fake_hour_input",
+            )
         with row[2]:
-            st.session_state.poi_fake_minute = st.number_input("Minute UTC", 0, 59, int(st.session_state.poi_fake_minute), key="poi_fake_minute_input")
+            st.session_state.poi_fake_minute = st.number_input(
+                "Minute UTC",
+                0,
+                59,
+                int(st.session_state.poi_fake_minute),
+                key="poi_fake_minute_input",
+            )
         with row[3]:
-            st.session_state.poi_fake_play = st.toggle("Lecture faux live", value=st.session_state.poi_fake_play, key="poi_fake_play_toggle")
+            st.session_state.poi_fake_play = st.toggle(
+                "Lecture faux live",
+                value=st.session_state.poi_fake_play,
+                key="poi_fake_play_toggle",
+            )
         with row[4]:
             if st.button("Reset faux live", use_container_width=True, key="poi_fake_reset_btn"):
                 st.session_state.poi_fake_cursor_dt = datetime(
@@ -1178,11 +1260,28 @@ def _render_poi_modes(combined: bool) -> None:
                     tzinfo=timezone.utc,
                 )
                 st.session_state.poi_last_tick = None
+                st.rerun()
+
+        selected_dt = datetime(
+            st.session_state.poi_fake_date.year,
+            st.session_state.poi_fake_date.month,
+            st.session_state.poi_fake_date.day,
+            int(st.session_state.poi_fake_hour),
+            int(st.session_state.poi_fake_minute),
+            0,
+            tzinfo=timezone.utc,
+        )
+        if not st.session_state.poi_fake_play:
+            st.session_state.poi_fake_cursor_dt = selected_dt
 
     @st.fragment(run_every=st.session_state.get("poi_refresh_seconds", 5))
     def _render_poi_fragment():
         fragment_time_mode = st.session_state[f"clock_mode_{mode_key}"]
-        fragment_boat = st.session_state.poi_live_boat if fragment_time_mode == "Live" else st.session_state.poi_fake_boat
+        fragment_boat = (
+            st.session_state.poi_live_boat
+            if fragment_time_mode == "Live"
+            else st.session_state.poi_fake_boat
+        )
         _render_poi_fragment_body(combined, fragment_time_mode, fragment_boat)
 
     _render_poi_fragment()
@@ -1195,11 +1294,108 @@ mode = st.radio("Mode", ["Manuel", "POI API", "Manuel + POI", "Manuel + LENGTH_D
 
 
 
+
+def _compute_manual_len_poi_ref_dt() -> datetime:
+    """Reference time for Manual + LENGTH_DB + POI mode."""
+    _ensure_poi_state()
+    refresh_s = int(st.session_state.get("poi_refresh_seconds", 5))
+    now = datetime.now(timezone.utc)
+
+    if st.session_state.get("manual_len_poi_time_mode", "Live") == "Live":
+        return now
+
+    if "manual_len_poi_fake_cursor_dt" not in st.session_state:
+        st.session_state.manual_len_poi_fake_cursor_dt = datetime(2026, 6, 20, 19, 6, 0, tzinfo=timezone.utc)
+
+    if st.session_state.get("manual_len_poi_fake_play", False):
+        last_tick = st.session_state.get("manual_len_poi_last_tick", None)
+        if last_tick is None or (now - last_tick).total_seconds() >= refresh_s:
+            st.session_state.manual_len_poi_last_tick = now
+            st.session_state.manual_len_poi_fake_cursor_dt = (
+                st.session_state.manual_len_poi_fake_cursor_dt + timedelta(seconds=refresh_s)
+            )
+
+    return st.session_state.manual_len_poi_fake_cursor_dt
+
+
+def _render_manual_len_poi_time_controls(ref_dt: datetime) -> datetime:
+    """Render Live/Faux-live controls and return the reference time."""
+    ctrl = st.columns([1.0, 1.1, 0.8, 0.8, 1.0, 1.0])
+
+    with ctrl[0]:
+        current = st.session_state.get("manual_len_poi_time_mode", "Live")
+        st.session_state.manual_len_poi_time_mode = st.radio(
+            "Horloge",
+            ["Live", "Faux live"],
+            horizontal=True,
+            index=0 if current == "Live" else 1,
+            key="manual_len_poi_clock_mode",
+        )
+
+    if st.session_state.manual_len_poi_time_mode == "Faux live":
+        with ctrl[1]:
+            st.session_state.manual_len_poi_fake_date = st.date_input(
+                "Date",
+                value=st.session_state.get("manual_len_poi_fake_date", date(2026, 6, 20)),
+                key="manual_len_poi_fake_date_input",
+            )
+        with ctrl[2]:
+            st.session_state.manual_len_poi_fake_hour = st.number_input(
+                "Heure UTC",
+                0,
+                23,
+                int(st.session_state.get("manual_len_poi_fake_hour", 19)),
+                key="manual_len_poi_fake_hour_input",
+            )
+        with ctrl[3]:
+            st.session_state.manual_len_poi_fake_minute = st.number_input(
+                "Minute UTC",
+                0,
+                59,
+                int(st.session_state.get("manual_len_poi_fake_minute", 6)),
+                key="manual_len_poi_fake_minute_input",
+            )
+        with ctrl[4]:
+            st.session_state.manual_len_poi_fake_play = st.toggle(
+                "Lecture faux live",
+                value=bool(st.session_state.get("manual_len_poi_fake_play", False)),
+                key="manual_len_poi_fake_play_toggle",
+            )
+        with ctrl[5]:
+            if st.button("Reset faux live", use_container_width=True, key="manual_len_poi_fake_reset"):
+                st.session_state.manual_len_poi_fake_cursor_dt = datetime(
+                    st.session_state.manual_len_poi_fake_date.year,
+                    st.session_state.manual_len_poi_fake_date.month,
+                    st.session_state.manual_len_poi_fake_date.day,
+                    int(st.session_state.manual_len_poi_fake_hour),
+                    int(st.session_state.manual_len_poi_fake_minute),
+                    0,
+                    tzinfo=timezone.utc,
+                )
+                st.session_state.manual_len_poi_last_tick = None
+                st.rerun()
+
+        selected_dt = datetime(
+            st.session_state.manual_len_poi_fake_date.year,
+            st.session_state.manual_len_poi_fake_date.month,
+            st.session_state.manual_len_poi_fake_date.day,
+            int(st.session_state.manual_len_poi_fake_hour),
+            int(st.session_state.manual_len_poi_fake_minute),
+            0,
+            tzinfo=timezone.utc,
+        )
+        if not st.session_state.manual_len_poi_fake_play:
+            st.session_state.manual_len_poi_fake_cursor_dt = selected_dt
+            ref_dt = selected_dt
+
+    st.caption(f"Heure de référence UTC : {ref_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+    return ref_dt
+
 @st.fragment(run_every=st.session_state.get("poi_refresh_seconds", 5))
 def _render_manual_length_poi_fragment() -> None:
-    ref_dt = datetime.now(timezone.utc)
+    _ensure_poi_state()
+    ref_dt = _compute_manual_len_poi_ref_dt()
     boat = st.session_state.get("poi_live_boat", "FRA")
-
     try:
         raw = _fetch_pois(
             ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S),
@@ -1228,6 +1424,9 @@ def _render_manual_length_poi_fragment() -> None:
         ),
         unsafe_allow_html=True,
     )
+
+    st.markdown("---")
+    ref_dt = _render_manual_len_poi_time_controls(ref_dt)
 
     c1, c2 = st.columns([1.2, 1.0])
     with c1:
