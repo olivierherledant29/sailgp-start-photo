@@ -28,6 +28,7 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 from influx_io import get_cfg, _query_data_frame_safe
+import html
 
 load_dotenv()
 SAILGP_POI_TOKEN = os.getenv("SAILGP_POI_TOKEN")
@@ -86,6 +87,83 @@ def _result_line_html(count_b: int, tr1_b: int, tr2_b: int, dispo_b: int,
     </div>
     """
 
+
+def _result_line_with_source_html(source: str, count_b: int, tr1_b: int, tr2_b: int, dispo_b: int,
+                                  count_t: int, tr1_t: int, tr2_t: int, dispo_t: int) -> str:
+    return f"""
+    <div style="width:100%; display:flex; align-items:center; gap:10px; white-space:nowrap;">
+        <div style="min-width:70px; font-size:11px; opacity:0.72; text-transform:uppercase; letter-spacing:0.04em;">{source}</div>
+        <div style="flex:1;">
+            {_result_line_html(count_b, tr1_b, tr2_b, dispo_b, count_t, tr1_t, tr2_t, dispo_t)}
+        </div>
+    </div>
+    """
+
+
+
+def _result_line_with_source_live_manual_html(source: str, metrics: dict[str, int]) -> str:
+    """Manual result line with client-side 1 Hz countdown for tr fields.
+
+    This avoids relying on Streamlit fragment cadence for the visual decrement.
+    Counts/dispo are still refreshed by Streamlit on button clicks/reruns.
+    """
+    uid = f"manual_live_{int(time.time() * 1000)}"
+    source_safe = html.escape(source)
+
+    count_b = int(metrics.get("count_b", 0))
+    count_t = int(metrics.get("count_t", 0))
+    tr1_b = int(metrics.get("tr1_b", 0))
+    tr2_b = int(metrics.get("tr2_b", 0))
+    tr1_t = int(metrics.get("tr1_t", 0))
+    tr2_t = int(metrics.get("tr2_t", 0))
+    dispo_b = int(metrics.get("dispo_b", 0))
+    dispo_t = int(metrics.get("dispo_t", 0))
+
+    return f"""
+    <div style="width:100%; display:flex; align-items:center; gap:10px; white-space:nowrap;">
+        <div style="min-width:70px; font-size:11px; opacity:0.72; text-transform:uppercase; letter-spacing:0.04em;">{source_safe}</div>
+        <div style="flex:1;">
+            <div style="width:100%; font-size:18px; display:flex; justify-content:space-between; white-space:nowrap;">
+                <div>
+                    Count_B:{count_b} |
+                    tr_1move_B:<span id="{uid}_tr1_b">{tr1_b}</span> |
+                    tr_2moves_B:<span id="{uid}_tr2_b">{tr2_b}</span> |
+                    dispo_BAB:{_colored_dispo(dispo_b, RED)}
+                </div>
+                <div>
+                    Count_T:{count_t} |
+                    tr_1move_T:<span id="{uid}_tr1_t">{tr1_t}</span> |
+                    tr_2moves_T:<span id="{uid}_tr2_t">{tr2_t}</span> |
+                    dispo_TRIB:{_colored_dispo(dispo_t, GREEN)}
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>
+    (function() {{
+        const startMs = Date.now();
+        const vals = {{
+            tr1_b: {tr1_b},
+            tr2_b: {tr2_b},
+            tr1_t: {tr1_t},
+            tr2_t: {tr2_t}
+        }};
+        function setVal(k, v) {{
+            const el = document.getElementById("{uid}_" + k);
+            if (el) el.textContent = String(Math.max(0, v));
+        }}
+        function tick() {{
+            const elapsed = Math.floor((Date.now() - startMs) / 1000);
+            setVal("tr1_b", vals.tr1_b - elapsed);
+            setVal("tr2_b", vals.tr2_b - elapsed);
+            setVal("tr1_t", vals.tr1_t - elapsed);
+            setVal("tr2_t", vals.tr2_t - elapsed);
+        }}
+        tick();
+        window.setInterval(tick, 1000);
+    }})();
+    </script>
+    """
 
 # -----------------------------
 # Manual mode helpers
@@ -327,7 +405,7 @@ def _ensure_poi_state() -> None:
     defaults = {
         "poi_analysis_cache": {},
         "poi_auto_refresh": True,
-        "poi_refresh_seconds": 5,
+        "poi_refresh_seconds": 3,
         "poi_fake_date": date(2026, 3, 1),
         "poi_fake_hour": 6,
         "poi_fake_minute": 55,
@@ -336,7 +414,7 @@ def _ensure_poi_state() -> None:
         "poi_live_boat": "FRA",
         "poi_fake_boat": "ESP",
         "poi_last_tick": None,
-        "poi_refresh_seconds_prev": 5,
+        "poi_refresh_seconds_prev": 3,
         "poi_show_length_graph": False,
         "combo_show_length_graph": False,
         "poi_show_length_debug": False,
@@ -836,14 +914,130 @@ def _render_manual_length_mode() -> None:
 
 
 
+
+def _sample_db_plot_value_at(df: pd.DataFrame, ts: datetime, col: str) -> float | None:
+    """Return plotted DB value (-m) at/near timestamp for a marker."""
+    try:
+        if df is None or getattr(df, "empty", True) or "time" not in df.columns or col not in df.columns:
+            return None
+        d = df[["time", col]].dropna().sort_values("time")
+        if d.empty:
+            return None
+        t = pd.Timestamp(ts)
+        # Prefer nearest sample at or after the marker start, fallback nearest before.
+        after = d[d["time"] >= t]
+        row = after.iloc[0] if not after.empty else d.iloc[-1]
+        return float(-(1 / 1000.0) * row[col])
+    except Exception:
+        return None
+
+
+def _detect_db_length_board_moves(df_len, ref_dt: datetime) -> list[dict[str, Any]]:
+    """Detect board moves from raw DB length channels.
+
+    Rule:
+    - drop: raw DB length decreases by >= 0.2 m within <= 2 s, if previous move on that side was raise
+    - raise: raw DB length increases by >= 0.2 m within <= 2 s, if previous move on that side was drop
+    - the event timestamp is the beginning of the detected move
+    """
+    if df_len is None or getattr(df_len, "empty", True) or "time" not in df_len.columns:
+        return []
+
+    events: list[dict[str, Any]] = []
+    threshold_m = 0.20
+    threshold_mm = threshold_m * 1000.0
+    max_dt_s = 2.0
+    out_start = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S)
+
+    for col, side in [("LENGTH_DB_H_P_mm", "port"), ("LENGTH_DB_H_S_mm", "starboard")]:
+        if col not in df_len.columns:
+            continue
+
+        d = df_len[["time", col]].dropna().sort_values("time").copy()
+        if len(d) < 2:
+            continue
+
+        times = list(pd.to_datetime(d["time"]))
+        vals = [float(v) for v in d[col].to_list()]
+        last_move: str | None = None
+        i = 0
+
+        while i < len(times) - 1:
+            t0 = times[i].to_pydatetime() if hasattr(times[i], "to_pydatetime") else times[i]
+            if t0.tzinfo is None:
+                t0 = t0.replace(tzinfo=timezone.utc)
+            else:
+                t0 = t0.astimezone(timezone.utc)
+
+            v0 = vals[i]
+            found = False
+
+            j = i + 1
+            while j < len(times):
+                tj = times[j].to_pydatetime() if hasattr(times[j], "to_pydatetime") else times[j]
+                if tj.tzinfo is None:
+                    tj = tj.replace(tzinfo=timezone.utc)
+                else:
+                    tj = tj.astimezone(timezone.utc)
+                dt_s = (tj - t0).total_seconds()
+                if dt_s > max_dt_s:
+                    break
+
+                dv = vals[j] - v0
+                event_type = None
+                if dv <= -threshold_mm and last_move in (None, "boardraise"):
+                    event_type = "boarddrop"
+                elif dv >= threshold_mm and last_move in (None, "boarddrop"):
+                    event_type = "boardraise"
+
+                if event_type is not None:
+                    if out_start <= t0 <= ref_dt:
+                        events.append({
+                            "dt": t0,
+                            "side": side,
+                            "type": event_type,
+                            "source": "DB_length",
+                            "db_col": col,
+                            "y_db": float(-(1 / 1000.0) * v0),
+                        })
+                    last_move = event_type
+                    # Skip ahead to avoid repeated detections inside the same physical move.
+                    i = j
+                    found = True
+                    break
+                j += 1
+
+            if not found:
+                i += 1
+
+    events.sort(key=lambda e: e["dt"])
+    return events
+
+
 def _build_poi_length_figure(
     ref_dt: datetime,
     poi_events: list[dict[str, Any]],
     poi_metrics: dict[str, int] | None,
     df_len,
+    db_events: list[dict[str, Any]] | None = None,
 ) -> go.Figure:
     _ensure_manual_plot_click_state()
     fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    # Keep the primary Y axis alive even when POI markers are not plotted.
+    # Manual button markers and vertical reference lines use this left axis.
+    fig.add_trace(
+        go.Scatter(
+            x=[ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S + 10), ref_dt + timedelta(seconds=10)],
+            y=[-1.35, 1.30],
+            mode="markers",
+            marker=dict(size=0, opacity=0),
+            name="_primary_axis_anchor",
+            showlegend=False,
+            hoverinfo="skip",
+        ),
+        secondary_y=False,
+    )
 
     x0 = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S + 10)
     x1 = ref_dt + timedelta(seconds=10)
@@ -890,56 +1084,39 @@ def _build_poi_length_figure(
         except Exception:
             pass
 
-    # --- POI markers, on primary Y
-    added_names = set()
-    for e in poi_events:
-        typ = str(e.get("type", "")).lower()
-        side = str(e.get("side") or e.get("board_side") or "").lower()
-        ts = e.get("dt") or e.get("ts") or e.get("time") or e.get("start_datetime")
-        if ts is None:
-            continue
-        if not isinstance(ts, datetime):
-            try:
-                ts = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(timezone.utc)
-            except Exception:
-                continue
 
-        if typ == "boardraise":
-            y = 1.0
-            symbol = "circle"
-            label = "POI boardraise"
-        elif typ == "boarddrop":
-            y = 0.0
-            symbol = "circle"
-            label = "POI boarddrop"
-        elif typ == "boardmovepenalty":
-            y = -1.0
-            symbol = "square"
-            label = "POI penalty"
-        else:
-            continue
+    # --- DB_length detected board move markers, on secondary Y and on the DB curves
+    # Port = red cross on DB P, Starboard = green cross on DB S.
+    if db_events:
+        for side, color, name in [
+            ("port", RED, "DB_length BAB move"),
+            ("starboard", GREEN, "DB_length TRIB move"),
+        ]:
+            xs, ys = [], []
+            for e in db_events:
+                if e.get("side") != side:
+                    continue
+                ts = e.get("dt")
+                col = e.get("db_col")
+                yv = e.get("y_db")
+                if yv is None and col:
+                    yv = _sample_db_plot_value_at(df_len, ts, col)
+                if ts is not None and yv is not None and x0 <= ts <= x1:
+                    xs.append(ts)
+                    ys.append(float(yv))
 
-        color = RED if side in ("port", "babord") else GREEN if side in ("starboard", "tribord") else "white"
-        showlegend = label not in added_names
-        added_names.add(label)
-
-        fig.add_trace(
-            go.Scatter(
-                x=[ts],
-                y=[y],
-                mode="markers",
-                marker=dict(
-                    color=color,
-                    size=11,
-                    symbol=symbol,
-                    line=dict(color="black", width=0.8),
-                ),
-                name=label,
-                showlegend=showlegend,
-                hovertemplate="%{x|%H:%M:%S} UTC<extra>" + label + "</extra>",
-            ),
-            secondary_y=False,
-        )
+            if xs:
+                fig.add_trace(
+                    go.Scatter(
+                        x=xs,
+                        y=ys,
+                        mode="markers",
+                        marker=dict(color=color, size=10, symbol="x", line=dict(color=color, width=2.2)),
+                        name=name,
+                        hovertemplate="%{x|%H:%M:%S} UTC<extra>" + name + "</extra>",
+                    ),
+                    secondary_y=True,
+                )
 
     # --- Vertical reference markers on primary POI axis.
     # Explicit Scatter traces are more robust than add_vline with secondary_y subplots.
@@ -980,7 +1157,7 @@ def _build_poi_length_figure(
     # +1 Babord = red square, +1 Tribord = green square.
     # They use absolute UTC timestamps, so they scroll left with the same X axis.
     try:
-        cutoff_clicks = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S)
+        cutoff_clicks = ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S + 10)
         st.session_state.manual_plot_clicks_b = [
             t for t in st.session_state.get("manual_plot_clicks_b", []) if t >= cutoff_clicks
         ]
@@ -1043,8 +1220,8 @@ def _build_poi_length_figure(
     # Primary Y is fixed so POI markers cannot disappear because of DB autoscale.
     fig.update_yaxes(
         tickmode="array",
-        tickvals=[1.0, 0.0, -1.0],
-        ticktext=["Raise", "Drop", "Penalty"],
+        tickvals=[1.18, 1.0, 0.0, -1.0],
+        ticktext=["Manual", "Raise", "Drop", "Penalty"],
         range=[-1.35, 1.30],
         showgrid=False,
         tickfont=dict(size=8),
@@ -1274,7 +1451,7 @@ def _render_poi_modes(combined: bool) -> None:
         if not st.session_state.poi_fake_play:
             st.session_state.poi_fake_cursor_dt = selected_dt
 
-    @st.fragment(run_every=st.session_state.get("poi_refresh_seconds", 5))
+    @st.fragment(run_every=st.session_state.get("poi_refresh_seconds", 3))
     def _render_poi_fragment():
         fragment_time_mode = st.session_state[f"clock_mode_{mode_key}"]
         fragment_boat = (
@@ -1298,7 +1475,7 @@ mode = st.radio("Mode", ["Manuel", "POI API", "Manuel + POI", "Manuel + LENGTH_D
 def _compute_manual_len_poi_ref_dt() -> datetime:
     """Reference time for Manual + LENGTH_DB + POI mode."""
     _ensure_poi_state()
-    refresh_s = int(st.session_state.get("poi_refresh_seconds", 5))
+    refresh_s = int(st.session_state.get("poi_refresh_seconds", 3))
     now = datetime.now(timezone.utc)
 
     if st.session_state.get("manual_len_poi_time_mode", "Live") == "Live":
@@ -1391,34 +1568,107 @@ def _render_manual_len_poi_time_controls(ref_dt: datetime) -> datetime:
     st.caption(f"Heure de référence UTC : {ref_dt.strftime('%Y-%m-%d %H:%M:%S')}")
     return ref_dt
 
-@st.fragment(run_every=st.session_state.get("poi_refresh_seconds", 5))
+@st.fragment(run_every=1)
 def _render_manual_length_poi_fragment() -> None:
+    """Mode 5 renderer.
+
+    Fragment cadence is 1s so the manual TR countdown updates every second.
+    DB/POI fetching is throttled separately by st.session_state.poi_refresh_seconds.
+    The Plotly figure is rebuilt every second from cached DB/POI data so manual
+    button markers also appear immediately on the time series.
+    """
     _ensure_poi_state()
+    _ensure_manual_plot_click_state()
+
     ref_dt = _compute_manual_len_poi_ref_dt()
     boat = st.session_state.get("poi_live_boat", "FRA")
-    try:
-        raw = _fetch_pois(
-            ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S),
-            ref_dt,
-            boat,
-            ["boarddrop", "boardraise", "boardmovepenalty"],
-        )
-        poi_events = _dedup_poi_events(_normalize_poi_events(raw))
-        pm = _poi_metrics(poi_events, ref_dt)
-    except Exception:
-        poi_events = []
-        pm = {"count_b": 0, "tr1_b": 0, "tr2_b": 0, "dispo_b": 6, "count_t": 0, "tr1_t": 0, "tr2_t": 0, "dispo_t": 6}
+    refresh_s = int(st.session_state.get("poi_refresh_seconds", 3))
+    time_mode = st.session_state.get("manual_len_poi_time_mode", "Live")
 
-    try:
-        df_len = _load_length_db_timeseries(ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S), ref_dt, boat)
-    except Exception:
-        df_len = None
+    # Manual metrics must be computed on every 1s fragment tick.
+    manual_m = _manual_metrics()
 
-    fig = _build_poi_length_figure(ref_dt, poi_events, pm, df_len)
+    now_wall = datetime.now(timezone.utc)
+    cache = st.session_state.get("mode5_db_poi_cache", {})
+    last_update = cache.get("updated_at")
+
+    force_fetch = False
+    if not cache:
+        force_fetch = True
+    elif cache.get("boat") != boat:
+        force_fetch = True
+    elif cache.get("time_mode") != time_mode:
+        force_fetch = True
+    elif last_update is None:
+        force_fetch = True
+    elif (now_wall - last_update).total_seconds() >= refresh_s:
+        force_fetch = True
+
+    # In paused faux-live, any cursor change must refresh DB/POI immediately.
+    if time_mode == "Faux live" and cache.get("ref_dt") != ref_dt:
+        force_fetch = True
+
+    if force_fetch:
+        try:
+            raw = _fetch_pois(
+                ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S),
+                ref_dt,
+                boat,
+                ["boarddrop", "boardraise", "boardmovepenalty"],
+            )
+            poi_events = _dedup_poi_events(_normalize_poi_events(raw))
+            pm = _poi_metrics(poi_events, ref_dt)
+        except Exception:
+            poi_events = []
+            pm = {"count_b": 0, "tr1_b": 0, "tr2_b": 0, "dispo_b": 6, "count_t": 0, "tr1_t": 0, "tr2_t": 0, "dispo_t": 6}
+
+        try:
+            df_len = _load_length_db_timeseries(ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S), ref_dt, boat)
+        except Exception:
+            df_len = None
+
+        db_events = _detect_db_length_board_moves(df_len, ref_dt)
+        dbm = _poi_metrics(db_events, ref_dt)
+
+        cache = {
+            "updated_at": now_wall,
+            "boat": boat,
+            "time_mode": time_mode,
+            "ref_dt": ref_dt,
+            "poi_events": poi_events,
+            "pm": pm,
+            "df_len": df_len,
+            "db_events": db_events,
+            "dbm": dbm,
+        }
+        st.session_state.mode5_db_poi_cache = cache
+    else:
+        poi_events = cache.get("poi_events", [])
+        pm = cache.get("pm", {"count_b": 0, "tr1_b": 0, "tr2_b": 0, "dispo_b": 6, "count_t": 0, "tr1_t": 0, "tr2_t": 0, "dispo_t": 6})
+        df_len = cache.get("df_len", None)
+        db_events = cache.get("db_events", [])
+        dbm = cache.get("dbm", {"count_b": 0, "tr1_b": 0, "tr2_b": 0, "dispo_b": 6, "count_t": 0, "tr1_t": 0, "tr2_t": 0, "dispo_t": 6})
+
+    # Rebuild the figure every second so manual button markers refresh immediately,
+    # while using cached DB/POI data between fetches.
+    fig = _build_poi_length_figure(ref_dt, poi_events, pm, df_len, db_events=db_events)
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown(
-        _result_line_html(
+        _result_line_with_source_live_manual_html("manuel", manual_m),
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        _result_line_with_source_html(
+            "DB_length",
+            dbm["count_b"], dbm["tr1_b"], dbm["tr2_b"], dbm["dispo_b"],
+            dbm["count_t"], dbm["tr1_t"], dbm["tr2_t"], dbm["dispo_t"],
+        ),
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        _result_line_with_source_html(
+            "POI",
             pm["count_b"], pm["tr1_b"], pm["tr2_b"], pm["dispo_b"],
             pm["count_t"], pm["tr1_t"], pm["tr2_t"], pm["dispo_t"],
         ),
@@ -1430,30 +1680,31 @@ def _render_manual_length_poi_fragment() -> None:
 
     c1, c2 = st.columns([1.2, 1.0])
     with c1:
-        st.session_state.poi_live_boat = st.text_input(
+        new_boat = st.text_input(
             "Boat code POI/LENGTH_DB",
             value=st.session_state.get("poi_live_boat", "FRA"),
             key="manual_len_poi_boat",
-        )
+        ).strip().upper() or "FRA"
+        if new_boat != st.session_state.get("poi_live_boat", "FRA"):
+            st.session_state.poi_live_boat = new_boat
+            st.session_state.pop("mode5_db_poi_cache", None)
+            st.rerun()
+
     with c2:
-        refresh_s = st.number_input(
-            "Refresh POI/LENGTH_DB (s)",
+        new_refresh_s = st.number_input(
+            "Refresh DB/POI (s)",
             min_value=1,
             max_value=30,
-            value=int(st.session_state.get("poi_refresh_seconds", 5)),
+            value=int(st.session_state.get("poi_refresh_seconds", 3)),
             step=1,
             key="manual_len_poi_refresh",
         )
-
-        if "poi_refresh_seconds_prev" not in st.session_state:
-            st.session_state.poi_refresh_seconds_prev = int(refresh_s)
-
-        if int(refresh_s) != int(st.session_state.poi_refresh_seconds_prev):
-            st.session_state.poi_refresh_seconds_prev = int(refresh_s)
-            st.session_state.poi_refresh_seconds = int(refresh_s)
+        new_refresh_s = int(new_refresh_s)
+        if new_refresh_s != int(st.session_state.get("poi_refresh_seconds", 3)):
+            st.session_state.poi_refresh_seconds = new_refresh_s
+            st.session_state.poi_refresh_seconds_prev = new_refresh_s
+            st.session_state.pop("mode5_db_poi_cache", None)
             st.rerun()
-
-        st.session_state.poi_refresh_seconds = int(refresh_s)
 
 if mode == "Manuel":
     _render_manual_controls(show_line=False)
@@ -1467,7 +1718,6 @@ elif mode == "Manuel + POI":
 
 elif mode == "Manuel + LENGTH_DB + POI":
     _render_manual_controls(show_line=False)
-    _render_manual_line_fragment()
     _render_manual_length_poi_fragment()
 
 else:
