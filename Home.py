@@ -4,7 +4,7 @@ st.set_page_config(page_title="SailGP Start Photo", layout="wide")
 st.title("SailGP – Start Photo")
 
 st.write("Choisir le mode :")
-c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
+c1, c2, c3, c4, c5, c6, c7, c8, c9 = st.columns(9)
 
 with c1:
     st.subheader("Replay")
@@ -53,3 +53,9 @@ with c8:
     st.write("Analyse aile : CA1, twist, targets interpolées.")
     if st.button("Ouvrir Wing Trim"):
         st.switch_page("pages/8_Wing_Trim.py")
+
+with c9:
+    st.subheader("Winning Traces")
+    st.write("recherche meilleures traces sur une course")
+    if st.button("Ouvrir Winning traces"):
+        st.switch_page("pages/9_Winning_Traces.py")

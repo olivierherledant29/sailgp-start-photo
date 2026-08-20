@@ -66,44 +66,112 @@ def parse_course_limit_xml(xml_bytes: bytes) -> pd.DataFrame:
 
 
 def parse_marks_xml(xml_bytes: bytes) -> pd.DataFrame:
-    """Parse mark positions (e.g. SL1/SL2/M1) from the SailGP XML.
+    """
+    Parse mark positions from SailGP XML.
 
-    Expected structure (common in SailGP exports):
-      <Course> ... <Mark Name="SL1" TargetLat="..." TargetLng="..." ... />
+    Compatible avec :
+      ancien format :
+        SL1, SL2, M1, LG1, LG2, WG1, WG2, FL1, FL2
 
-    Returns a DataFrame with columns: mark, lat, lon (float).
-    If no marks found, returns empty DataFrame with those columns.
+      nouveau format :
+        VSL1, VSL2, VM1, VLG1, VLG2, VWG1, VWG2, VFL1, VFL2
+
+    Les noms du nouveau format sont normalisés vers les noms historiques
+    attendus par les pages Streamlit.
+
+    Retourne un DataFrame avec colonnes :
+        mark, lat, lon
     """
     try:
         root = ET.fromstring(xml_bytes)
     except Exception:
         return pd.DataFrame(columns=["mark", "lat", "lon"])
 
+    known_marks = {
+        "SL1", "SL2",
+        "M1",
+        "LG1", "LG2",
+        "WG1", "WG2",
+        "FL1", "FL2",
+    }
+
     rows = []
+
     for m in root.findall(".//Mark"):
-        name = (m.attrib.get("Name") or m.attrib.get("name") or "").strip()
+        name = (
+            m.attrib.get("Name")
+            or m.attrib.get("name")
+            or ""
+        ).strip()
+
         if not name:
             continue
 
-        # Common attribute names
-        lat_s = m.attrib.get("TargetLat") or m.attrib.get("lat") or m.attrib.get("Lat")
-        lon_s = m.attrib.get("TargetLng") or m.attrib.get("lng") or m.attrib.get("Lon") or m.attrib.get("LonDeg")
+        # Nouveau format SailGP :
+        # VSL1 -> SL1
+        # VSL2 -> SL2
+        # VM1  -> M1
+        # VLG1 -> LG1
+        # VLG2 -> LG2
+        # VWG1 -> WG1
+        # VWG2 -> WG2
+        # VFL1 -> FL1
+        # VFL2 -> FL2
+        #
+        # On retire le préfixe V uniquement si le résultat
+        # correspond à une marque connue.
+        if (
+            name.startswith("V")
+            and len(name) > 1
+            and name[1:] in known_marks
+        ):
+            name = name[1:]
+
+        lat_s = (
+            m.attrib.get("TargetLat")
+            or m.attrib.get("lat")
+            or m.attrib.get("Lat")
+        )
+
+        lon_s = (
+            m.attrib.get("TargetLng")
+            or m.attrib.get("lng")
+            or m.attrib.get("Lon")
+            or m.attrib.get("LonDeg")
+        )
 
         try:
             lat = float(lat_s) if lat_s is not None else float("nan")
             lon = float(lon_s) if lon_s is not None else float("nan")
         except Exception:
-            lat, lon = float("nan"), float("nan")
+            lat = float("nan")
+            lon = float("nan")
 
         if not (pd.notna(lat) and pd.notna(lon)):
             continue
 
-        rows.append({"mark": name, "lat": lat, "lon": lon})
+        # Certains XML peuvent stocker les coordonnées en degrés * 1e7
+        lat, lon = _maybe_scale_latlon(lat, lon)
+
+        rows.append(
+            {
+                "mark": name,
+                "lat": lat,
+                "lon": lon,
+            }
+        )
 
     if not rows:
         return pd.DataFrame(columns=["mark", "lat", "lon"])
 
     df = pd.DataFrame(rows)
+
     # Keep first occurrence for duplicates
-    df = df.dropna(subset=["mark", "lat", "lon"]).drop_duplicates(subset=["mark"], keep="first").reset_index(drop=True)
+    df = (
+        df
+        .dropna(subset=["mark", "lat", "lon"])
+        .drop_duplicates(subset=["mark"], keep="first")
+        .reset_index(drop=True)
+    )
+
     return df
