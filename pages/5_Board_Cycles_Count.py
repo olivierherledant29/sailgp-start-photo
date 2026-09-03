@@ -26,6 +26,7 @@ def _flux_z(dt):
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from telemetry_io import get_backend, get_cfg, load_channels_timeseries
 import html
@@ -346,8 +347,16 @@ def _render_manual_line_fragment() -> None:
 # Next start timer (manual mode only)
 # -----------------------------
 def _render_next_start_timer() -> None:
+    """
+    Manual-only start timer.
+
+    Important: the visual clock/countdown is refreshed in the browser with
+    JavaScript every 100 ms. It does NOT trigger Streamlit reruns at 10 Hz.
+    This makes tenths/offsets such as +0.3 s usable on Streamlit Cloud.
+    """
     if "ns_running" not in st.session_state:
         st.session_state.ns_running = False
+
     now_utc = datetime.now(timezone.utc)
     if "ns_hour" not in st.session_state:
         st.session_state.ns_hour = now_utc.hour
@@ -357,75 +366,209 @@ def _render_next_start_timer() -> None:
         st.session_state.ns_offset_tenths = 0
 
     st.subheader("Next start timer")
+
     c0, c1 = st.columns([1.1, 1.0])
     with c0:
+        # Static fallback/initial value. The large timer below is the 10 Hz display.
         st.metric("UTC", now_utc.strftime("%H:%M:%S"))
     with c1:
-        st.session_state.ns_running = st.toggle("Timer ON", value=st.session_state.ns_running, key="ns_running_toggle")
+        st.session_state.ns_running = st.toggle(
+            "Timer ON",
+            value=st.session_state.ns_running,
+            key="ns_running_toggle",
+        )
 
     st.caption("Choix du prochain départ (UTC)")
     ch, cm = st.columns([1.2, 1.2])
+
     with ch:
         bh1, bh2, bh3 = st.columns([0.55, 1.0, 0.55])
         with bh1:
             if st.button("−", key="ns_hour_minus"):
                 st.session_state.ns_hour = (int(st.session_state.ns_hour) - 1) % 24
         with bh2:
-            st.session_state.ns_hour = st.number_input("Heure", 0, 23, int(st.session_state.ns_hour), key="ns_hour_input")
+            st.session_state.ns_hour = st.number_input(
+                "Heure",
+                0,
+                23,
+                int(st.session_state.ns_hour),
+                key="ns_hour_input",
+            )
         with bh3:
             if st.button("+", key="ns_hour_plus"):
                 st.session_state.ns_hour = (int(st.session_state.ns_hour) + 1) % 24
+
     with cm:
         bm1, bm2, bm3 = st.columns([0.55, 1.0, 0.55])
         with bm1:
             if st.button("−", key="ns_min_minus"):
                 st.session_state.ns_min = (int(st.session_state.ns_min) - 1) % 60
         with bm2:
-            st.session_state.ns_min = st.number_input("Minutes", 0, 59, int(st.session_state.ns_min), key="ns_min_input")
+            st.session_state.ns_min = st.number_input(
+                "Minutes",
+                0,
+                59,
+                int(st.session_state.ns_min),
+                key="ns_min_input",
+            )
         with bm3:
             if st.button("+", key="ns_min_plus"):
                 st.session_state.ns_min = (int(st.session_state.ns_min) + 1) % 60
 
     st.caption("Offset sur le décompte affiché (dixièmes de seconde)")
     co1, co2, co3, co4 = st.columns([0.9, 1.15, 0.9, 1.25])
+
     with co1:
         if st.button("−0.1s", key="ns_off_minus"):
             st.session_state.ns_offset_tenths = int(st.session_state.ns_offset_tenths) - 1
+
     with co2:
-        st.session_state.ns_offset_tenths = st.number_input("Offset (x0.1s)", value=int(st.session_state.ns_offset_tenths), step=1, key="ns_off_input")
+        st.session_state.ns_offset_tenths = st.number_input(
+            "Offset (x0.1s)",
+            value=int(st.session_state.ns_offset_tenths),
+            step=1,
+            key="ns_off_input",
+        )
+
     with co3:
         if st.button("+0.1s", key="ns_off_plus"):
             st.session_state.ns_offset_tenths = int(st.session_state.ns_offset_tenths) + 1
+
+    offset_s = float(st.session_state.ns_offset_tenths) / 10.0
     with co4:
-        offset_s = float(st.session_state.ns_offset_tenths) / 10.0
         st.write(f"Offset = **{offset_s:+.1f}s**")
 
-    now_utc = datetime.now(timezone.utc)
-    target = now_utc.replace(hour=int(st.session_state.ns_hour), minute=int(st.session_state.ns_min), second=0, microsecond=0)
-    if target < now_utc:
+    # Recompute after widgets/buttons, because a widget interaction reruns the page.
+    server_now = datetime.now(timezone.utc)
+    target = server_now.replace(
+        hour=int(st.session_state.ns_hour),
+        minute=int(st.session_state.ns_min),
+        second=0,
+        microsecond=0,
+    )
+    if target < server_now:
         target += timedelta(days=1)
-    tts = (target - now_utc).total_seconds()
-    tts_corr = tts + offset_s
 
-    st.markdown(
-        f"""
-<div style="text-align:center; margin-top:20px; margin-bottom:10px;">
-  <div style="font-size:120px; font-weight:700; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; color:#00BFFF; line-height:1.0;">
-    {_fmt_mmss(tts)}
-  </div>
-  <div style="font-size:120px; font-weight:700; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; color:#FF7F00; line-height:1.0;">
-    {_fmt_mmss(tts_corr)}
-  </div>
-  <div style="margin-top:8px; font-size:18px; opacity:0.75;">
-    Start (UTC): {target.strftime('%H:%M:%S')} &nbsp; | &nbsp; Offset: {offset_s:+.1f}s
+    server_now_ms = server_now.timestamp() * 1000.0
+    target_ms = target.timestamp() * 1000.0
+    offset_ms = offset_s * 1000.0
+    running_js = "true" if st.session_state.ns_running else "false"
+
+    # Browser-side display:
+    # - 100 ms refresh
+    # - no Python rerun
+    # - time base anchored to server UTC at render time and advanced with
+    #   performance.now(), so it does not depend on the browser wall clock.
+    timer_html = f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body {{
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    overflow: hidden;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }}
+  .wrap {{
+    text-align: center;
+    padding-top: 12px;
+  }}
+  .utc {{
+    font-size: 20px;
+    opacity: 0.72;
+    margin-bottom: 8px;
+  }}
+  .timer {{
+    font-size: clamp(64px, 9vw, 120px);
+    font-weight: 700;
+    line-height: 1.02;
+    white-space: nowrap;
+  }}
+  #raw {{ color: #00BFFF; }}
+  #corr {{ color: #FF7F00; }}
+  .meta {{
+    margin-top: 10px;
+    font-size: 18px;
+    opacity: 0.75;
+  }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="utc" class="utc"></div>
+  <div id="raw" class="timer">--:--.-</div>
+  <div id="corr" class="timer">--:--.-</div>
+  <div class="meta">
+    Start (UTC): {target.strftime('%H:%M:%S')}
+    &nbsp; | &nbsp;
+    Offset: {offset_s:+.1f}s
   </div>
 </div>
-""",
-        unsafe_allow_html=True,
-    )
 
-    if st.session_state.ns_running and _HAS_AUTOREFRESH:
-        st_autorefresh(interval=1000, key="next_start_refresh")
+<script>
+(() => {{
+  const serverBaseMs = {server_now_ms:.3f};
+  const targetMs = {target_ms:.3f};
+  const offsetMs = {offset_ms:.3f};
+  const running = {running_js};
+  const perfBase = performance.now();
+
+  function serverNowMs() {{
+    return serverBaseMs + (performance.now() - perfBase);
+  }}
+
+  function fmtCountdown(ms) {{
+    const sign = ms < 0 ? "-" : "";
+    const a = Math.abs(ms);
+    const totalTenths = Math.floor(a / 100);
+    const tenths = totalTenths % 10;
+    const totalSeconds = Math.floor(totalTenths / 10);
+    const seconds = totalSeconds % 60;
+    const minutes = Math.floor(totalSeconds / 60);
+    return sign
+      + String(minutes).padStart(2, "0")
+      + ":"
+      + String(seconds).padStart(2, "0")
+      + "."
+      + String(tenths);
+  }}
+
+  function fmtUtc(ms) {{
+    const d = new Date(ms);
+    const hh = String(d.getUTCHours()).padStart(2, "0");
+    const mm = String(d.getUTCMinutes()).padStart(2, "0");
+    const ss = String(d.getUTCSeconds()).padStart(2, "0");
+    const tenth = Math.floor(d.getUTCMilliseconds() / 100);
+    return "UTC " + hh + ":" + mm + ":" + ss + "." + tenth;
+  }}
+
+  function tick() {{
+    const now = serverNowMs();
+    const raw = targetMs - now;
+    const corrected = raw + offsetMs;
+
+    document.getElementById("utc").textContent = fmtUtc(now);
+    document.getElementById("raw").textContent = fmtCountdown(raw);
+    document.getElementById("corr").textContent = fmtCountdown(corrected);
+  }}
+
+  tick();
+
+  // Timer OFF leaves the rendered value frozen. Timer ON updates locally
+  // in the browser every 100 ms; Streamlit Cloud is not rerun at 10 Hz.
+  if (running) {{
+    window.setInterval(tick, 100);
+  }}
+}})();
+</script>
+</body>
+</html>
+"""
+
+    components.html(timer_html, height=310, scrolling=False)
 
 
 # -----------------------------
