@@ -47,25 +47,110 @@ def _resolve_path(value: str) -> str:
     return str(p.resolve())
 
 
+def _secret_value(name: str, default=None):
+    """
+    Read a value from environment first, then Streamlit secrets.
+    This keeps local .env behavior unchanged while supporting Streamlit Cloud.
+    """
+    env_val = os.getenv(name)
+    if env_val not in (None, ""):
+        return env_val
+
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+
+    return default
+
+
+def _looks_like_pem(value: str) -> bool:
+    s = str(value or "")
+    return "-----BEGIN " in s and "-----END " in s
+
+
+def _materialize_pem(value: str, filename: str) -> str:
+    """
+    Write PEM content to a private temp file for libpq/psycopg2.
+    PostgreSQL expects sslcert/sslkey as file paths, not raw PEM strings.
+    """
+    tmp_dir = Path("/tmp/sailgp_timescale_ssl")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    path = tmp_dir / filename
+    content = str(value).replace("\\n", "\n").strip() + "\n"
+    path.write_text(content, encoding="utf-8")
+
+    # Private key must not be group/world-readable for libpq.
+    if filename.endswith(".key"):
+        try:
+            path.chmod(0o600)
+        except Exception:
+            pass
+
+    return str(path)
+
+
+def _resolve_ssl_material(
+    path_or_pem_name: str,
+    pem_name: str,
+    default_path: str,
+    temp_filename: str,
+) -> str:
+    """
+    Resolution order:
+      1) TIMESCALE_SSL_*_PEM from env / st.secrets
+      2) TIMESCALE_SSL_* from env / st.secrets:
+         - PEM content -> /tmp file
+         - existing path -> use path
+      3) local default certs/client.* path
+    """
+    pem_value = _secret_value(pem_name)
+    if pem_value:
+        return _materialize_pem(str(pem_value), temp_filename)
+
+    value = _secret_value(path_or_pem_name, default_path)
+    if value and _looks_like_pem(str(value)):
+        return _materialize_pem(str(value), temp_filename)
+
+    resolved = _resolve_path(str(value or default_path))
+    if Path(resolved).exists():
+        return resolved
+
+    raise FileNotFoundError(
+        f"Matériel SSL Timescale introuvable pour {path_or_pem_name}. "
+        f"Chemin testé : {resolved}. "
+        f"Sur Streamlit Cloud, ajoute {pem_name} dans st.secrets."
+    )
+
+
 def get_cfg() -> TimescaleCfg:
-    password = os.getenv("TIMESCALE_PASSWORD")
+    password = _secret_value("TIMESCALE_PASSWORD")
     if not password:
-        raise RuntimeError("TIMESCALE_PASSWORD manquant dans .env")
+        raise RuntimeError(
+            "TIMESCALE_PASSWORD manquant dans .env / Streamlit secrets"
+        )
 
-    sslcert = _resolve_path(os.getenv("TIMESCALE_SSL_CERT", "certs/client.crt"))
-    sslkey = _resolve_path(os.getenv("TIMESCALE_SSL_KEY", "certs/client.key"))
-
-    if not Path(sslcert).exists():
-        raise FileNotFoundError(f"Certificat Timescale introuvable : {sslcert}")
-    if not Path(sslkey).exists():
-        raise FileNotFoundError(f"Clé privée Timescale introuvable : {sslkey}")
+    sslcert = _resolve_ssl_material(
+        path_or_pem_name="TIMESCALE_SSL_CERT",
+        pem_name="TIMESCALE_SSL_CERT_PEM",
+        default_path="certs/client.crt",
+        temp_filename="client.crt",
+    )
+    sslkey = _resolve_ssl_material(
+        path_or_pem_name="TIMESCALE_SSL_KEY",
+        pem_name="TIMESCALE_SSL_KEY_PEM",
+        default_path="certs/client.key",
+        temp_filename="client.key",
+    )
 
     return TimescaleCfg(
-        host=os.getenv("TIMESCALE_HOST", DEFAULT_TS_HOST),
-        port=int(os.getenv("TIMESCALE_PORT", str(DEFAULT_TS_PORT))),
-        dbname=os.getenv("TIMESCALE_DB", DEFAULT_TS_DB),
-        user=os.getenv("TIMESCALE_USER", DEFAULT_TS_USER),
-        password=password,
+        host=str(_secret_value("TIMESCALE_HOST", DEFAULT_TS_HOST)),
+        port=int(_secret_value("TIMESCALE_PORT", str(DEFAULT_TS_PORT))),
+        dbname=str(_secret_value("TIMESCALE_DB", DEFAULT_TS_DB)),
+        user=str(_secret_value("TIMESCALE_USER", DEFAULT_TS_USER)),
+        password=str(password),
         sslcert=sslcert,
         sslkey=sslkey,
         sslrootcert=certifi.where(),
