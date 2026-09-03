@@ -773,85 +773,168 @@ def _load_length_db_timeseries(
     boat: str,
 ):
     """
-    Load DB length channels through telemetry_io.
+    Load DB length channels through telemetry_io / Timescale.
 
-    Read LENGTH_DB through the shared telemetry_io backend.
-    For the current app deployment, TELEMETRY_BACKEND=timescale uses the
-    new Timescale database, exactly like the other migrated telemetry pages.
-
-    A 200 ms bucket is used to preserve the <= 2 s board-move detection logic.
-    and preserve the <= 2 s board-move detection logic.
+    On Cloud we keep a small diagnostic in session_state instead of swallowing
+    exceptions silently. We first try 200 ms (best for board-move detection),
+    then 500 ms and 1 s as fallbacks if the query returns no rows or fails.
     """
+    channels = [
+        "LENGTH_DB_H_P_mm",
+        "LENGTH_DB_H_S_mm",
+    ]
+    boat = str(boat).strip().upper()
+
+    diag = {
+        "backend": None,
+        "boat": boat,
+        "start_utc": str(start_utc),
+        "stop_utc": str(stop_utc),
+        "attempts": [],
+        "rows": 0,
+        "columns": [],
+        "error": None,
+        "bucket_used": None,
+    }
+
     try:
+        diag["backend"] = get_backend()
         cfg = get_cfg()
+    except Exception as e:
+        diag["error"] = f"{type(e).__name__}: {e}"
+        st.session_state["length_db_diag"] = diag
+        return None
 
-        channels = [
-            "LENGTH_DB_H_P_mm",
-            "LENGTH_DB_H_S_mm",
-        ]
+    last_error = None
+    df = None
 
-        df = load_channels_timeseries(
-            cfg=cfg,
-            boats=[str(boat).strip().upper()],
-            channels=channels,
-            start_utc=start_utc,
-            stop_utc=stop_utc,
-            every="200ms",
-            level_expr="strm",
-            agg_fn="last",
-        )
+    for every in ("200ms", "500ms", "1s"):
+        try:
+            candidate = load_channels_timeseries(
+                cfg=cfg,
+                boats=[boat],
+                channels=channels,
+                start_utc=start_utc,
+                stop_utc=stop_utc,
+                every=every,
+                level_expr="strm",
+                agg_fn="last",
+            )
 
-        if df is None or df.empty:
-            return None
+            nrows = 0 if candidate is None else len(candidate)
+            cols = [] if candidate is None else list(candidate.columns)
 
+            diag["attempts"].append({
+                "every": every,
+                "rows": nrows,
+                "columns": cols,
+                "error": None,
+            })
+
+            if candidate is not None and not candidate.empty:
+                df = candidate
+                diag["bucket_used"] = every
+                break
+
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            diag["attempts"].append({
+                "every": every,
+                "rows": 0,
+                "columns": [],
+                "error": last_error,
+            })
+
+    if df is None or df.empty:
+        diag["error"] = last_error or "Aucune ligne retournée par Timescale"
+        st.session_state["length_db_diag"] = diag
+        return None
+
+    try:
         out = df.copy()
+        diag["rows"] = len(out)
+        diag["columns"] = list(out.columns)
 
-        if "time_utc" not in out.columns:
+        # telemetry_io contract is time_utc, but accept "time" too for robustness.
+        if "time_utc" in out.columns:
+            out["time"] = pd.to_datetime(out["time_utc"], utc=True, errors="coerce")
+        elif "time" in out.columns:
+            out["time"] = pd.to_datetime(out["time"], utc=True, errors="coerce")
+        else:
+            diag["error"] = (
+                "Colonne temporelle absente. "
+                f"Colonnes reçues: {list(out.columns)}"
+            )
+            st.session_state["length_db_diag"] = diag
             return None
 
-        out["time"] = pd.to_datetime(
-            out["time_utc"],
-            utc=True,
-            errors="coerce",
-        )
+        # Ensure both expected channels exist, even if one side has no values.
+        for ch in channels:
+            if ch not in out.columns:
+                out[ch] = pd.NA
+            out[ch] = pd.to_numeric(out[ch], errors="coerce")
 
-        keep_cols = [
-            c
-            for c in [
-                "time",
-                "LENGTH_DB_H_P_mm",
-                "LENGTH_DB_H_S_mm",
-            ]
-            if c in out.columns
-        ]
-
-        if "time" not in keep_cols:
-            return None
-
-        out = out[keep_cols].copy()
-
-        for ch in [
-            "LENGTH_DB_H_P_mm",
-            "LENGTH_DB_H_S_mm",
-        ]:
-            if ch in out.columns:
-                out[ch] = pd.to_numeric(
-                    out[ch],
-                    errors="coerce",
-                )
+        # Keep boat information only for diagnostics if present.
+        if "boat" in out.columns and not out.empty:
+            diag["boats_returned"] = sorted(out["boat"].dropna().astype(str).unique().tolist())
 
         out = (
-            out
+            out[["time", *channels]]
             .dropna(subset=["time"])
             .sort_values("time")
             .drop_duplicates(subset=["time"], keep="last")
             .reset_index(drop=True)
         )
 
+        diag["rows_clean"] = len(out)
+        if not out.empty:
+            diag["first_time"] = str(out["time"].iloc[0])
+            diag["last_time"] = str(out["time"].iloc[-1])
+            diag["valid_P"] = int(out["LENGTH_DB_H_P_mm"].notna().sum())
+            diag["valid_S"] = int(out["LENGTH_DB_H_S_mm"].notna().sum())
+
+        if out.empty:
+            diag["error"] = "DataFrame vide après nettoyage time/channel"
+            st.session_state["length_db_diag"] = diag
+            return None
+
+        if (
+            out["LENGTH_DB_H_P_mm"].notna().sum() == 0
+            and out["LENGTH_DB_H_S_mm"].notna().sum() == 0
+        ):
+            diag["error"] = "Aucune valeur numérique sur les deux canaux LENGTH_DB"
+            st.session_state["length_db_diag"] = diag
+            return None
+
+        diag["error"] = None
+        st.session_state["length_db_diag"] = diag
         return out
 
-    except Exception:
+    except Exception as e:
+        diag["error"] = f"{type(e).__name__}: {e}"
+        st.session_state["length_db_diag"] = diag
         return None
+
+
+def _render_length_db_diagnostic() -> None:
+    """Compact Cloud/local diagnostic shown only when LENGTH_DB is missing."""
+    diag = st.session_state.get("length_db_diag")
+    if not diag:
+        return
+
+    error = diag.get("error")
+    if not error:
+        return
+
+    st.warning(
+        "LENGTH_DB : aucune donnée exploitable. "
+        f"backend={diag.get('backend')} | boat={diag.get('boat')} | "
+        f"{diag.get('start_utc')} → {diag.get('stop_utc')}",
+        icon="⚠️",
+    )
+    with st.expander("Diagnostic LENGTH_DB", expanded=False):
+        st.write(diag)
+
 
 def _build_length_db_figure(df, ref_dt: datetime) -> go.Figure:
     fig = go.Figure()
@@ -1730,6 +1813,9 @@ def _render_manual_length_poi_fragment() -> None:
     # while using cached DB/POI data between fetches.
     fig = _build_poi_length_figure(ref_dt, poi_events, pm, df_len, db_events=db_events)
     st.plotly_chart(fig, use_container_width=True)
+
+    if df_len is None or getattr(df_len, "empty", True):
+        _render_length_db_diagnostic()
 
     st.markdown(
         _result_line_with_source_live_manual_html("manuel", manual_m),
