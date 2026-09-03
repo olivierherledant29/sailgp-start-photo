@@ -5,7 +5,7 @@ from start_aid.embedded import render_start_aid
 
 st.set_page_config(page_title="Start Aid", layout="wide")
 
-st.title("Start Aid (XML only)")
+st.title("Start Aid")
 
 with st.sidebar:
     boundary_df = sidebar_boundary_uploader()

@@ -29,7 +29,7 @@ def _render_vmg_info(out: dict):
 
 _show_deploy_debug()
 
-st.title("Routeur (XML only)")
+st.title("Routeur")
 
 with st.sidebar:
     boundary_df = sidebar_boundary_uploader()
