@@ -27,7 +27,7 @@ def _flux_z(dt):
 import requests
 import streamlit as st
 from dotenv import load_dotenv
-from influx_io import get_cfg, _query_data_frame_safe
+from telemetry_io import get_backend, get_cfg, load_channels_timeseries
 import html
 
 load_dotenv()
@@ -44,6 +44,13 @@ except Exception:
 
 st.set_page_config(page_title="Board cycles count", layout="wide")
 st.title("Board cycles count")
+try:
+    _telemetry_backend = get_backend().lower()
+    st.caption(f"Telemetry backend : {_telemetry_backend.upper()}")
+    if _telemetry_backend != "timescale":
+        st.caption("LENGTH_DB suivra le backend telemetry_io configuré ; mettre TELEMETRY_BACKEND=timescale pour la nouvelle DB.")
+except Exception:
+    pass
 
 WINDOW = 60
 GRAPH_LOOKBACK_S = 120
@@ -222,6 +229,27 @@ def _ensure_manual_plot_click_state() -> None:
 
 
 
+
+
+def _manual_plot_timestamp() -> datetime:
+    """Timestamp used only for plotting +1B/+1T markers.
+
+    Manual counting always uses real wall-clock time. In the combined fake-live
+    mode, however, graph markers must be timestamped on the fake-live timeline
+    or they would fall outside the displayed X window.
+    """
+    current_mode = st.session_state.get("board_cycles_mode", "Manuel")
+    if current_mode == "Manuel + LENGTH_DB + POI":
+        if st.session_state.get("manual_len_poi_time_mode", "Live") == "Faux live":
+            try:
+                return _compute_manual_len_poi_ref_dt()
+            except Exception:
+                return st.session_state.get(
+                    "manual_len_poi_fake_cursor_dt",
+                    datetime(2026, 6, 20, 19, 6, 0, tzinfo=timezone.utc),
+                )
+    return datetime.now(timezone.utc)
+
 def _render_manual_controls(show_line: bool = True) -> None:
     _ensure_manual_state()
     _ensure_manual_plot_click_state()
@@ -242,9 +270,10 @@ def _render_manual_controls(show_line: bool = True) -> None:
 
             with c1:
                 if st.button("+1 B", use_container_width=True):
-                    ts = datetime.now(timezone.utc)
-                    st.session_state.press_history["babord"].append(ts.timestamp())
-                    st.session_state.setdefault("manual_plot_clicks_b", []).append(ts)
+                    wall_ts = datetime.now(timezone.utc)
+                    plot_ts = _manual_plot_timestamp()
+                    st.session_state.press_history["babord"].append(wall_ts.timestamp())
+                    st.session_state.setdefault("manual_plot_clicks_b", []).append(plot_ts)
 
             with c2:
                 if st.button("Undo B", use_container_width=True):
@@ -262,9 +291,10 @@ def _render_manual_controls(show_line: bool = True) -> None:
 
             with c3:
                 if st.button("+1 T", use_container_width=True):
-                    ts = datetime.now(timezone.utc)
-                    st.session_state.press_history["tribord"].append(ts.timestamp())
-                    st.session_state.setdefault("manual_plot_clicks_t", []).append(ts)
+                    wall_ts = datetime.now(timezone.utc)
+                    plot_ts = _manual_plot_timestamp()
+                    st.session_state.press_history["tribord"].append(wall_ts.timestamp())
+                    st.session_state.setdefault("manual_plot_clicks_t", []).append(plot_ts)
 
             with c4:
                 if st.button("Undo T", use_container_width=True):
@@ -737,45 +767,91 @@ def _compute_ref_dt(time_mode: str) -> datetime:
 
 
 
-def _load_length_db_timeseries(start_utc: datetime, stop_utc: datetime, boat: str):
+def _load_length_db_timeseries(
+    start_utc: datetime,
+    stop_utc: datetime,
+    boat: str,
+):
+    """
+    Load DB length channels through telemetry_io.
+
+    Read LENGTH_DB through the shared telemetry_io backend.
+    For the current app deployment, TELEMETRY_BACKEND=timescale uses the
+    new Timescale database, exactly like the other migrated telemetry pages.
+
+    A 200 ms bucket is used to preserve the <= 2 s board-move detection logic.
+    and preserve the <= 2 s board-move detection logic.
+    """
     try:
         cfg = get_cfg()
-        dfs = []
-        for ch in ["LENGTH_DB_H_P_mm", "LENGTH_DB_H_S_mm"]:
-            boats_regex = re.escape(boat)
-            flux = f"""
-from(bucket: "{cfg.bucket}")
-  |> range(start: {_flux_z(start_utc)}, stop: {_flux_z(stop_utc)})
-  |> filter(fn: (r) => r._measurement == "{ch}")
-  |> filter(fn: (r) => r._field == "value" and r.level == "strm")
-  |> filter(fn: (r) => r.boat =~ /^{boats_regex}/)
-  |> keep(columns: ["_time", "_value", "boat"])
-  |> rename(columns: {{_time: "time", _value: "{ch}"}})
-"""
-            df = _query_data_frame_safe(cfg, flux)
-            if df is not None and not df.empty:
-                df = df.copy()
-                if "time" in df.columns:
-                    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-                dfs.append(df)
 
-        if not dfs:
+        channels = [
+            "LENGTH_DB_H_P_mm",
+            "LENGTH_DB_H_S_mm",
+        ]
+
+        df = load_channels_timeseries(
+            cfg=cfg,
+            boats=[str(boat).strip().upper()],
+            channels=channels,
+            start_utc=start_utc,
+            stop_utc=stop_utc,
+            every="200ms",
+            level_expr="strm",
+            agg_fn="last",
+        )
+
+        if df is None or df.empty:
             return None
 
-        merged = None
-        for df in dfs:
-            cols = [c for c in df.columns if c != "boat"]
-            cur = df[cols].drop_duplicates()
-            if merged is None:
-                merged = cur
-            else:
-                merged = pd.merge(merged, cur, on="time", how="outer")
+        out = df.copy()
 
-        return merged.sort_values("time").reset_index(drop=True)
+        if "time_utc" not in out.columns:
+            return None
+
+        out["time"] = pd.to_datetime(
+            out["time_utc"],
+            utc=True,
+            errors="coerce",
+        )
+
+        keep_cols = [
+            c
+            for c in [
+                "time",
+                "LENGTH_DB_H_P_mm",
+                "LENGTH_DB_H_S_mm",
+            ]
+            if c in out.columns
+        ]
+
+        if "time" not in keep_cols:
+            return None
+
+        out = out[keep_cols].copy()
+
+        for ch in [
+            "LENGTH_DB_H_P_mm",
+            "LENGTH_DB_H_S_mm",
+        ]:
+            if ch in out.columns:
+                out[ch] = pd.to_numeric(
+                    out[ch],
+                    errors="coerce",
+                )
+
+        out = (
+            out
+            .dropna(subset=["time"])
+            .sort_values("time")
+            .drop_duplicates(subset=["time"], keep="last")
+            .reset_index(drop=True)
+        )
+
+        return out
 
     except Exception:
         return None
-
 
 def _build_length_db_figure(df, ref_dt: datetime) -> go.Figure:
     fig = go.Figure()
@@ -1467,7 +1543,8 @@ def _render_poi_modes(combined: bool) -> None:
 # -----------------------------
 # Page body
 # -----------------------------
-mode = st.radio("Mode", ["Manuel", "POI API", "Manuel + POI", "Manuel + LENGTH_DB", "Manuel + LENGTH_DB + POI"], horizontal=True)
+mode = st.radio("Mode", ["Manuel", "Manuel + LENGTH_DB + POI"], horizontal=True)
+st.session_state.board_cycles_mode = mode
 
 
 
@@ -1675,8 +1752,28 @@ def _render_manual_length_poi_fragment() -> None:
         unsafe_allow_html=True,
     )
 
+
+
+def _render_manual_len_poi_bottom_controls() -> None:
+    """Stable controls for mode Manuel + LENGTH_DB + POI.
+
+    Kept outside the auto-refresh fragment so Live/Faux live widgets remain
+    usable while the graph/results refresh independently.
+    """
+    _ensure_poi_state()
+
     st.markdown("---")
-    ref_dt = _render_manual_len_poi_time_controls(ref_dt)
+
+    time_mode = st.session_state.get("manual_len_poi_time_mode", "Live")
+    if time_mode == "Faux live":
+        ref_dt = st.session_state.get(
+            "manual_len_poi_fake_cursor_dt",
+            datetime(2026, 6, 20, 19, 6, 0, tzinfo=timezone.utc),
+        )
+    else:
+        ref_dt = datetime.now(timezone.utc)
+
+    _render_manual_len_poi_time_controls(ref_dt)
 
     c1, c2 = st.columns([1.2, 1.0])
     with c1:
@@ -1706,21 +1803,15 @@ def _render_manual_length_poi_fragment() -> None:
             st.session_state.pop("mode5_db_poi_cache", None)
             st.rerun()
 
+
 if mode == "Manuel":
     _render_manual_controls(show_line=False)
     _render_manual_line_fragment()
     st.divider()
     _render_next_start_timer()
-elif mode == "POI API":
-    _render_poi_modes(combined=False)
-elif mode == "Manuel + POI":
-    _render_poi_modes(combined=True)
 
 elif mode == "Manuel + LENGTH_DB + POI":
     _render_manual_controls(show_line=False)
     _render_manual_length_poi_fragment()
+    _render_manual_len_poi_bottom_controls()
 
-else:
-    _render_manual_controls(show_line=False)
-    _render_manual_line_fragment()
-    _render_manual_length_mode()
