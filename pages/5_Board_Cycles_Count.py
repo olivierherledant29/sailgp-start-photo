@@ -240,7 +240,7 @@ def _manual_plot_timestamp() -> datetime:
     or they would fall outside the displayed X window.
     """
     current_mode = st.session_state.get("board_cycles_mode", "Manuel")
-    if current_mode == "Manuel + LENGTH_DB + POI":
+    if current_mode in ("Manuel + LENGTH_DB", "Manuel + LENGTH_DB + POI"):
         if st.session_state.get("manual_len_poi_time_mode", "Live") == "Faux live":
             try:
                 return _compute_manual_len_poi_ref_dt()
@@ -1769,7 +1769,7 @@ def _render_poi_modes(combined: bool) -> None:
 # -----------------------------
 # Page body
 # -----------------------------
-mode = st.radio("Mode", ["Manuel", "Manuel + LENGTH_DB + POI"], horizontal=True)
+mode = st.radio("Mode", ["Manuel", "Manuel + LENGTH_DB", "Manuel + LENGTH_DB + POI"], horizontal=True)
 st.session_state.board_cycles_mode = mode
 
 
@@ -2033,11 +2033,164 @@ def _render_manual_len_poi_bottom_controls() -> None:
             st.rerun()
 
 
+@st.fragment(run_every=1)
+def _render_manual_length_only_fragment() -> None:
+    """Manuel + LENGTH_DB, without any POI API request.
+
+    The fragment still redraws every second for manual countdown/markers.
+    LENGTH_DB fetching is throttled by the same refresh setting, but this mode
+    never calls _fetch_pois() nor POI analysis endpoints.
+    """
+    _ensure_poi_state()
+    _ensure_manual_plot_click_state()
+
+    ref_dt = _compute_manual_len_poi_ref_dt()
+    boat = st.session_state.get("poi_live_boat", "FRA")
+    refresh_s = int(st.session_state.get("poi_refresh_seconds", 3))
+    time_mode = st.session_state.get("manual_len_poi_time_mode", "Live")
+
+    manual_m = _manual_metrics()
+
+    now_wall = datetime.now(timezone.utc)
+    cache = st.session_state.get("mode_length_only_cache", {})
+    last_update = cache.get("updated_at")
+
+    force_fetch = (
+        not cache
+        or cache.get("boat") != boat
+        or cache.get("time_mode") != time_mode
+        or last_update is None
+        or (now_wall - last_update).total_seconds() >= refresh_s
+    )
+
+    # Paused faux-live cursor changes must immediately reload LENGTH_DB.
+    if time_mode == "Faux live" and cache.get("ref_dt") != ref_dt:
+        force_fetch = True
+
+    if force_fetch:
+        try:
+            df_len = _load_length_db_timeseries(
+                ref_dt - timedelta(seconds=GRAPH_LOOKBACK_S),
+                ref_dt,
+                boat,
+            )
+        except Exception:
+            df_len = None
+
+        db_events = _detect_db_length_board_moves(df_len, ref_dt)
+        dbm = _poi_metrics(db_events, ref_dt)
+
+        cache = {
+            "updated_at": now_wall,
+            "boat": boat,
+            "time_mode": time_mode,
+            "ref_dt": ref_dt,
+            "df_len": df_len,
+            "db_events": db_events,
+            "dbm": dbm,
+        }
+        st.session_state.mode_length_only_cache = cache
+    else:
+        df_len = cache.get("df_len", None)
+        db_events = cache.get("db_events", [])
+        dbm = cache.get(
+            "dbm",
+            {
+                "count_b": 0, "tr1_b": 0, "tr2_b": 0, "dispo_b": 6,
+                "count_t": 0, "tr1_t": 0, "tr2_t": 0, "dispo_t": 6,
+            },
+        )
+
+    # Reuse the proven combined figure builder, but pass no POI events.
+    # This preserves exactly the LENGTH_DB curves, DB crosses, manual squares,
+    # and vertical time markers without making any POI network request.
+    empty_poi_metrics = {
+        "count_b": 0, "tr1_b": 0, "tr2_b": 0, "dispo_b": 6,
+        "count_t": 0, "tr1_t": 0, "tr2_t": 0, "dispo_t": 6,
+    }
+    fig = _build_poi_length_figure(
+        ref_dt,
+        [],
+        empty_poi_metrics,
+        df_len,
+        db_events=db_events,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    if df_len is None or getattr(df_len, "empty", True):
+        _render_length_db_diagnostic()
+
+    st.markdown(
+        _result_line_with_source_live_manual_html("manuel", manual_m),
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        _result_line_with_source_html(
+            "DB_length",
+            dbm["count_b"], dbm["tr1_b"], dbm["tr2_b"], dbm["dispo_b"],
+            dbm["count_t"], dbm["tr1_t"], dbm["tr2_t"], dbm["dispo_t"],
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _render_manual_length_only_bottom_controls() -> None:
+    """Stable controls for Manuel + LENGTH_DB, with no POI controls/API."""
+    _ensure_poi_state()
+
+    st.markdown("---")
+
+    time_mode = st.session_state.get("manual_len_poi_time_mode", "Live")
+    if time_mode == "Faux live":
+        ref_dt = st.session_state.get(
+            "manual_len_poi_fake_cursor_dt",
+            datetime(2026, 6, 20, 19, 6, 0, tzinfo=timezone.utc),
+        )
+    else:
+        ref_dt = datetime.now(timezone.utc)
+
+    # Reuse the same Live/Faux-live clock UI as the combined mode.
+    _render_manual_len_poi_time_controls(ref_dt)
+
+    c1, c2 = st.columns([1.2, 1.0])
+    with c1:
+        new_boat = st.text_input(
+            "Boat code LENGTH_DB",
+            value=st.session_state.get("poi_live_boat", "FRA"),
+            key="manual_len_only_boat",
+        ).strip().upper() or "FRA"
+        if new_boat != st.session_state.get("poi_live_boat", "FRA"):
+            st.session_state.poi_live_boat = new_boat
+            st.session_state.pop("mode_length_only_cache", None)
+            st.rerun()
+
+    with c2:
+        new_refresh_s = st.number_input(
+            "Refresh LENGTH_DB (s)",
+            min_value=1,
+            max_value=30,
+            value=int(st.session_state.get("poi_refresh_seconds", 3)),
+            step=1,
+            key="manual_len_only_refresh",
+        )
+        new_refresh_s = int(new_refresh_s)
+        if new_refresh_s != int(st.session_state.get("poi_refresh_seconds", 3)):
+            st.session_state.poi_refresh_seconds = new_refresh_s
+            st.session_state.poi_refresh_seconds_prev = new_refresh_s
+            st.session_state.pop("mode_length_only_cache", None)
+            st.rerun()
+
+
 if mode == "Manuel":
     _render_manual_controls(show_line=False)
     _render_manual_line_fragment()
     st.divider()
     _render_next_start_timer()
+
+elif mode == "Manuel + LENGTH_DB":
+    _render_manual_controls(show_line=False)
+    _render_manual_length_only_fragment()
+    _render_manual_length_only_bottom_controls()
 
 elif mode == "Manuel + LENGTH_DB + POI":
     _render_manual_controls(show_line=False)
