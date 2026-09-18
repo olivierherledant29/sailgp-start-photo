@@ -1,7 +1,7 @@
 import streamlit as st
 
 from boundary_shared import sidebar_boundary_uploader
-from start_aid.embedded import render_start_aid
+from start_aid.embedded import render_start_aid, render_trace_controls
 
 st.set_page_config(page_title="Start Aid", layout="wide")
 
@@ -30,3 +30,6 @@ if deck is not None:
             out["results_html"],
             unsafe_allow_html=True,
         )
+
+    if out:
+        render_trace_controls(out)

@@ -15,7 +15,7 @@ from .geo import (
 )
 
 
-def build_deck(ctx, geom, PI_xy, out):
+def build_deck(ctx, geom, PI_xy, out, selected_route_keys=None):
     to_utm, to_wgs = ctx["to_utm"], ctx["to_wgs"]
     centroid_lat, centroid_lon = ctx["centroid_lat"], ctx["centroid_lon"]
 
@@ -47,12 +47,28 @@ def build_deck(ctx, geom, PI_xy, out):
         for seg_xy in dashes_xy:
             lay_dashes.append({"path": xy_path_to_lonlat_path(seg_xy, to_wgs)})
 
-    # First legs red
-    first_leg_paths = out.get("first_leg_paths", [])
+    # Selected routes. None keeps backward compatibility and displays all routes.
+    selected_route_keys = None if selected_route_keys is None else set(selected_route_keys)
+
+    def route_is_selected(group, dest):
+        return selected_route_keys is None or f"{group}|{dest}" in selected_route_keys
+
+    selected_groups = None
+    if selected_route_keys is not None:
+        selected_groups = {key.split("|", 1)[0] for key in selected_route_keys}
+
+    # First legs red. A common first leg remains visible while at least one
+    # destination in its group is selected.
+    first_leg_paths = [
+        path for path in out.get("first_leg_paths", [])
+        if selected_groups is None or path.get("group") in selected_groups
+    ]
 
     # Second legs colored (per-segment layer)
     second_leg_layers = []
     for seg in out.get("traj_second_segments", []):
+        if not route_is_selected(seg.get("group"), seg.get("dest")):
+            continue
         second_leg_layers.append(
             pdk.Layer(
                 "PathLayer",

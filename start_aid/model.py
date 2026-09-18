@@ -93,6 +93,16 @@ SECOND_COLORS = {
     ("PAR_SL2", "to_SL2"): [255, 140, 0],
 }
 
+ROUTE_NAMES = {
+    ("buffer_BDY", "to_SL1"): "French Top",
+    ("buffer_BDY", "to_SP"): "French mid",
+    ("buffer_BDY", "to_SL2"): "French Bot",
+    ("LL_SL1", "to_SL2"): "WB Bot",
+    ("LL_SL1", "to_SP"): "WB Mid",
+    ("LL_SL1", "to_SL1"): "WB Top",
+    ("PAR_SL2", "to_SL2"): "late Pin",
+}
+
 
 def compute_startline_special_points(
     SL1_xy: np.ndarray,
@@ -234,13 +244,13 @@ def compute_all_geometry_and_times(
 
     if M_buffer_BDY_xy is not None:
         M_ll = xy_to_ll(to_wgs, M_buffer_BDY_xy[0], M_buffer_BDY_xy[1])
-        first_leg_paths.append({"path": [[PI_ll[1], PI_ll[0]], [M_ll[1], M_ll[0]]], "name": "PI->M_buffer_BDY"})
+        first_leg_paths.append({"path": [[PI_ll[1], PI_ll[0]], [M_ll[1], M_ll[0]]], "name": "PI->M_buffer_BDY", "group": "buffer_BDY"})
     if M_LL_SL1_xy is not None:
         M_ll = xy_to_ll(to_wgs, M_LL_SL1_xy[0], M_LL_SL1_xy[1])
-        first_leg_paths.append({"path": [[PI_ll[1], PI_ll[0]], [M_ll[1], M_ll[0]]], "name": "PI->M_LL_SL1"})
+        first_leg_paths.append({"path": [[PI_ll[1], PI_ll[0]], [M_ll[1], M_ll[0]]], "name": "PI->M_LL_SL1", "group": "LL_SL1"})
     if M_PAR_SL2_xy is not None:
         M_ll = xy_to_ll(to_wgs, M_PAR_SL2_xy[0], M_PAR_SL2_xy[1])
-        first_leg_paths.append({"path": [[PI_ll[1], PI_ll[0]], [M_ll[1], M_ll[0]]], "name": "PI->M_PAR_SL2"})
+        first_leg_paths.append({"path": [[PI_ll[1], PI_ll[0]], [M_ll[1], M_ll[0]]], "name": "PI->M_PAR_SL2", "group": "PAR_SL2"})
 
     bsp_retour_vals = []
 
@@ -288,6 +298,7 @@ def compute_all_geometry_and_times(
             )
 
             results.append({
+                "route_name": ROUTE_NAMES.get((gname, dname), f"{gname} → {dname}"),
                 "group": gname,
                 "dest": dname,
                 "t1": t1,
@@ -313,7 +324,8 @@ def compute_all_geometry_and_times(
     for r in results:
         c = rgb_to_css(r["color"])
         rows.append(
-            f"<tr>"
+            f"<tr data-route='{r['group']}|{r['dest']}'>"
+            f"<td style='font-weight:700; white-space:nowrap;'>{r['route_name']}</td>"
             f"<td>{r['group']}</td>"
             f"<td>{r['dest']}</td>"
             f"<td style='text-align:right;'>{r['t1']:.1f}</td>"
@@ -327,10 +339,11 @@ def compute_all_geometry_and_times(
         )
 
     results_html = f"""
-    <div style="font-size: 13px;">
-      <table style="width:100%; border-collapse: collapse;">
+    <div style="font-size:12px; line-height:1.15;">
+      <table style="width:100%; border-collapse:collapse; table-layout:auto;">
         <thead>
           <tr>
+            <th style="text-align:left; border-bottom:1px solid #666; white-space:nowrap;">nom</th>
             <th style="text-align:left; border-bottom:1px solid #666;">groupe</th>
             <th style="text-align:left; border-bottom:1px solid #666;">dest</th>
             <th style="text-align:right; border-bottom:1px solid #666;">t1 PI→M (s)</th>

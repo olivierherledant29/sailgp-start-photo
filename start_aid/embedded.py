@@ -12,6 +12,32 @@ from start_aid.viz import build_deck
 from start_aid.polars import list_polar_files, load_polar_interpolator
 
 
+DEFAULT_ROUTE_KEYS = {
+    "buffer_BDY|to_SL1",  # French Top
+    "buffer_BDY|to_SP",   # French mid
+    "buffer_BDY|to_SL2",  # French Bot
+}
+
+
+def _route_widget_key(route_key: str) -> str:
+    return f"start_aid_route_{route_key}"
+
+
+def _reset_route_visibility_defaults():
+    """Reset trace choices when a new boundary XML is loaded."""
+    all_route_keys = (
+        "buffer_BDY|to_SL1",
+        "buffer_BDY|to_SL2",
+        "buffer_BDY|to_SP",
+        "LL_SL1|to_SL1",
+        "LL_SL1|to_SL2",
+        "LL_SL1|to_SP",
+        "PAR_SL2|to_SL2",
+    )
+    for route_key in all_route_keys:
+        st.session_state[_route_widget_key(route_key)] = route_key in DEFAULT_ROUTE_KEYS
+
+
 def boundary_df_to_latlon(boundary_df: pd.DataFrame):
     if boundary_df is None or boundary_df.empty:
         return []
@@ -123,6 +149,7 @@ def render_start_aid(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
 
     if isinstance(xml_name, str) and xml_name and (xml_name != st.session_state["last_boundary_xml_name_start_aid"]):
         st.session_state["TWD_base"] = float(guess_twd_from_xml_name())
+        _reset_route_visibility_defaults()
         st.session_state["last_boundary_xml_name_start_aid"] = xml_name
 
     # -------------------------
@@ -325,5 +352,64 @@ def render_start_aid(boundary_df: pd.DataFrame, marks_df: pd.DataFrame):
     out["TTS_intersection"] = float(TTS_intersection)
     out["target_TTK_beforeTack"] = float(target_TTK_beforeTack)
 
-    deck = build_deck(ctx, geom, PI_xy, out)
+    route_results = out.get("results", [])
+    selected_route_keys = {
+        f"{result['group']}|{result['dest']}"
+        for result in route_results
+        if st.session_state.get(
+            _route_widget_key(f"{result['group']}|{result['dest']}"),
+            f"{result['group']}|{result['dest']}" in DEFAULT_ROUTE_KEYS,
+        )
+    }
+
+    # Apply the muted appearance directly to unchecked rows. Keeping the style
+    # inline avoids Markdown interpreting the table HTML as plain text.
+    disabled_route_keys = {
+        f"{result['group']}|{result['dest']}" for result in route_results
+    } - selected_route_keys
+    for route_key in disabled_route_keys:
+        row_tag = f"<tr data-route='{route_key}'>"
+        muted_row_tag = (
+            f"<tr data-route='{route_key}' "
+            "style='opacity:0.32; color:#888; filter:grayscale(1);'>"
+        )
+        out["results_html"] = out["results_html"].replace(row_tag, muted_row_tag)
+
+    out["selected_route_keys"] = sorted(selected_route_keys)
+    deck = build_deck(ctx, geom, PI_xy, out, selected_route_keys=selected_route_keys)
     return deck, out
+
+
+def render_trace_controls(out):
+    """Render route visibility controls at the page's current position."""
+    route_results = out.get("results", []) if out else []
+    if not route_results:
+        return
+
+    st.subheader("Traces affichées")
+    st.caption("Décoche une route pour masquer sa trace. Sa ligne reste dans le tableau, en gris.")
+    checkbox_columns = st.columns(3)
+
+    for index, result in enumerate(route_results):
+        group = str(result["group"])
+        dest = str(result["dest"])
+        route_key = f"{group}|{dest}"
+        label = str(result.get("route_name", f"{group} → {dest.removeprefix('to_')}"))
+        widget_key = _route_widget_key(route_key)
+        color = result.get("color", [255, 255, 255])
+        css_color = f"rgb({color[0]},{color[1]},{color[2]})"
+
+        with checkbox_columns[index % len(checkbox_columns)]:
+            check_col, label_col = st.columns([1, 5])
+            with check_col:
+                st.checkbox(
+                    label,
+                    value=route_key in DEFAULT_ROUTE_KEYS,
+                    key=widget_key,
+                    label_visibility="collapsed",
+                )
+            with label_col:
+                st.markdown(
+                    f"<span style='color:{css_color}; font-weight:700;'>{label}</span>",
+                    unsafe_allow_html=True,
+                )
