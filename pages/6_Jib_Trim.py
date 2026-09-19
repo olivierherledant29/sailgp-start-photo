@@ -8,7 +8,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from influx_io import ALL_BOATS, get_cfg, load_channels_timeseries
+from telemetry_io import ALL_BOATS, get_backend, get_cfg, load_channels_timeseries
 from target_utils import (
     build_targets_for_modes,
     load_target_workbook,
@@ -497,6 +497,7 @@ def _plot_button_timeseries(df):
     st.plotly_chart(fig, use_container_width=True)
 
 
+backend = get_backend()
 cfg = get_cfg()
 
 DEFAULT_START = _utc_dt(2026, 4, 12, 18, 33, 0)
@@ -504,6 +505,7 @@ DEFAULT_STOP = _utc_dt(2026, 4, 12, 18, 35, 0)
 
 with st.sidebar:
     st.header("Jib Trim controls")
+    st.caption(f"Telemetry backend : {backend.upper()}")
 
     time_mode = st.radio("Plage de temps", ["Time range", "Last X minutes"], index=1)
 
@@ -565,7 +567,7 @@ with st.spinner("Chargement des données Jib Trim..."):
     )
 
 if df_raw.empty:
-    st.warning("Aucune donnée retournée par Influx sur cette plage.")
+    st.warning(f"Aucune donnée retournée par {backend.upper()} sur cette plage.")
     st.stop()
 
 df_common = _filter_common(df_raw, bsp_min, yaw_rate_abs_max, vmg_target_pct_min)
