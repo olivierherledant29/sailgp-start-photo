@@ -4,7 +4,7 @@ st.set_page_config(page_title="SailGP Start Photo", layout="wide")
 st.title("SailGP – Start Photo")
 
 st.write("Choisir le mode :")
-c1, c2, c3, c4, c5, c6, c7, c8, c9, c10 = st.columns(10)
+c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11 = st.columns(11)
 
 with c1:
     st.subheader("Replay")
@@ -65,3 +65,9 @@ with c10:
     st.write("timer")
     if st.button("Ouvrir Count Down"):
         st.switch_page("pages/10_Count_Down.py")
+
+with c11:
+    st.subheader("RIB data")
+    st.write("Live RIB : BSP/TTS, hydraulique et données diverses.")
+    if st.button("Ouvrir RIB data"):
+        st.switch_page("pages/11_RIB_Data.py")
